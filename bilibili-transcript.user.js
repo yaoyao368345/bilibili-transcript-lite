@@ -1,9 +1,9 @@
 // ==UserScript==
-// @name         B站字幕提取器
-// @namespace    https://blog.qitongtingyu.online/
+// @name         B站字幕提取器 Lite
+// @namespace    https://github.com/yaoyao368345/bilibili-transcript-lite
 // @version      1.2.1
-// @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
-// @author       栖桐听雨
+// @description  B站字幕提取器的轻量改进版，支持分P、搜索、多格式导出和批量ZIP下载
+// @author       栖桐听雨（原作者）；yaoyao368345（Lite 版维护）
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
 // @grant        unsafeWindow
@@ -15,6 +15,8 @@
 // @connect      aisubtitle.hdslb.com
 // @run-at       document-end
 // @license      MIT
+// @updateURL    https://raw.githubusercontent.com/yaoyao368345/bilibili-transcript-lite/main/bilibili-transcript.user.js
+// @downloadURL  https://raw.githubusercontent.com/yaoyao368345/bilibili-transcript-lite/main/bilibili-transcript.user.js
 // ==/UserScript==
 
 (function () {

@@ -1,10 +1,10 @@
 # B站字幕提取器 Lite 1.2.1
 
-基于 [DFameMaster/bilibili-transcript](https://github.com/DFameMaster/bilibili-transcript) 的本地修改版。保留原作者信息与 MIT 声明；运行时不引入第三方框架或依赖。
+这是 [DFameMaster/bilibili-transcript](https://github.com/DFameMaster/bilibili-transcript) 的改进版，原作者为栖桐听雨，Lite 版由 [yaoyao368345](https://github.com/yaoyao368345) 维护。保留原项目 [MIT 许可证](LICENSE)及 `Copyright (c) 2026 sxt` 声明。主要改进包括分 P 的 CID 选择、Lite 界面、长字幕搜索和 Firefox 的批量 ZIP 下载。运行时不引入第三方框架或依赖。本仓库由原始脚本重建版本历史，并非上游仓库的 Git Fork。
 
 ## 安装
 
-打开 `bilibili-transcript.user.js`，将全部内容替换到篡改猴／脚本猫中现有的脚本，保存并刷新 B 站视频页。只启用一个版本。
+使用篡改猴或脚本猫导入 [`bilibili-transcript.user.js`](bilibili-transcript.user.js)，保存后刷新 B 站视频页。若此前安装过原版，请停用原版，避免两个脚本同时运行。发布后也可通过 [Raw 脚本链接](https://raw.githubusercontent.com/yaoyao368345/bilibili-transcript-lite/main/bilibili-transcript.user.js) 安装；脚本元数据已设置同一路径用于后续更新。
 
 ## 版本记录
 
@@ -17,7 +17,7 @@
 | `v1.2.0` | 开始批量下载后弹出必填命名窗口，将字幕写入同一新文件夹 |
 | `v1.2.1` | Firefox 默认 ZIP 下载；支持目录写入的浏览器可选择 ZIP 或文件夹 |
 
-当前项目中的 `bilibili-transcript.user.js` 是后续维护入口。父目录的旧 `bilibili-transcript-fixed.user.js` 保留为旧版文件，不作为最新版本入口。
+`bilibili-transcript.user.js` 是最新版本入口；本仓库的 Git 标签保留了开发过程中的版本。
 
 ## 1.2.1：ZIP 兼容下载
 
