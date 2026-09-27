@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站字幕提取器
 // @namespace    https://blog.qitongtingyu.online/
-// @version      1.2.0
+// @version      1.2.1
 // @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
 // @author       栖桐听雨
 // @match        https://www.bilibili.com/video/*
@@ -1463,7 +1463,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
     // Ask for a name only after video selection; the directory picker runs in the
     // confirm button's user activation, before any network awaits.
-    function chooseBatchDirectory() {
+    function chooseBatchDestination() {
         return new Promise(resolve => {
             removeModal('batch-name-modal');
             disableScroll();
@@ -1478,7 +1478,9 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         <div class="modal-body">
                             <label class="download-label" for="batch-folder-name">文件夹名称</label>
                             <input id="batch-folder-name" type="text" required maxlength="100" autocomplete="off" placeholder="例如：Linux 驱动学习字幕">
-                            <p>点击确定后选择保存位置，字幕将保存到其中的新文件夹。</p>
+                            <label class="download-label" for="batch-save-mode">保存方式</label>
+                            <select id="batch-save-mode"><option value="zip">下载 ZIP 压缩包</option><option value="directory">直接保存文件夹</option></select>
+                            <p id="batch-save-hint"></p>
                             <p id="batch-name-error" role="alert"></p>
                         </div>
                         <footer class="modal-footer"><button type="button" id="cancel-batch-name">取消</button><button type="submit" id="confirm-batch-name" class="btn-primary">确定</button></footer>
@@ -1492,20 +1494,37 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             const input = modal.querySelector('#batch-folder-name');
             const error = modal.querySelector('#batch-name-error');
             const button = modal.querySelector('#confirm-batch-name');
+            const owner = typeof window.showDirectoryPicker === 'function' ? window : pageWindow;
+            const supportsDirectory = typeof owner.showDirectoryPicker === 'function';
+            const mode = modal.querySelector('#batch-save-mode');
+            mode.querySelector('[value="directory"]').disabled = !supportsDirectory;
+            mode.value = supportsDirectory ? 'directory' : 'zip';
+            const updateHint = () => {
+                modal.querySelector('#batch-save-hint').textContent = mode.value === 'zip'
+                    ? '下载一个 ZIP 文件，解压后得到同名文件夹和全部已获取字幕。'
+                    : '点击确定后选择保存位置，字幕将保存到其中的新文件夹。';
+                error.textContent = '';
+            };
+            mode.addEventListener('change', updateHint);
+            updateHint();
             input.focus();
             modal.querySelector('form').addEventListener('submit', async event => {
                 event.preventDefault();
                 if (button.disabled || settled) return;
                 const name = input.value.trim();
-                if (!name || /[\\/:*?"<>|\u0000-\u001f]/.test(name) || /[. ]$/.test(name)
-                    || /^(?:\.{1,2}|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name)) {
+                if (!isValidBatchFolderName(name)) {
                     error.textContent = '请输入有效名称，不含路径符号、保留名称或末尾句点。';
                     input.focus();
                     return;
                 }
-                const owner = typeof window.showDirectoryPicker === 'function' ? window : pageWindow;
+                if (mode.value === 'zip') {
+                    settled = true;
+                    removeModal(modal.id);
+                    resolve({ mode: 'zip', name });
+                    return;
+                }
                 if (typeof owner.showDirectoryPicker !== 'function') {
-                    error.textContent = '当前浏览器不支持直接保存文件夹，请使用支持此功能的 Chrome 或 Edge。';
+                    error.textContent = '当前浏览器不支持直接保存文件夹，请选择 ZIP 压缩包。';
                     return;
                 }
                 button.disabled = true;
@@ -1524,7 +1543,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     if (settled || !modal.isConnected) return;
                     settled = true;
                     removeModal(modal.id);
-                    resolve({ directory, name });
+                    resolve({ mode: 'directory', directory, name });
                 } catch (failure) {
                     if (settled) return;
                     error.textContent = failure.name === 'AbortError' ? '已取消选择保存位置，可以重试或取消。'
@@ -1535,15 +1554,24 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         });
     }
 
-    async function saveSubtitleToDirectory(directory, content, filename, mimeType) {
-        // One filename component only, including for custom extensions. Never overwrite.
+    function isValidBatchFolderName(name) {
+        return !!name && name.length <= 100 && !/[\\/:*?"<>|\u0000-\u001f]/.test(name) && !/[. ]$/.test(name)
+            && !/^(?:\.{1,2}|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name);
+    }
+
+    function batchFilename(filename, index = 0) {
+        // One filename component only, including for custom extensions.
         const safe = filename.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[. ]+$/, '');
         const dot = safe.lastIndexOf('.');
         const stem = (dot > 0 ? safe.slice(0, dot) : safe).slice(0, 160) || 'subtitle';
         const extension = dot > 0 ? safe.slice(dot, dot + 30) : '';
         const base = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem) ? '_' + stem : stem;
+        return `${base}${index ? ` (${index + 1})` : ''}${extension}`;
+    }
+
+    async function saveSubtitleToDirectory(directory, content, filename, mimeType) {
         for (let index = 0; index < 10000; index++) {
-            const name = `${base}${index ? ` (${index + 1})` : ''}${extension}`;
+            const name = batchFilename(filename, index);
             try { await directory.getFileHandle(name); continue; }
             catch (error) { if (error.name !== 'NotFoundError') throw error; }
             const file = await directory.getFileHandle(name, { create: true });
@@ -1558,6 +1586,72 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             }
         }
         throw new Error('同名文件过多，无法保存。');
+    }
+
+    // ZIP STORE (no compression dependency). UTF-8 names, CRC32, classic ZIP limits.
+    // Format reference: https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
+    async function buildBatchZip(folder, files) {
+        if (!isValidBatchFolderName(folder)) throw new Error('文件夹名称无效。');
+        if (files.length > 65534) throw new Error('文件数量过多，请分批下载。');
+        const encoder = new TextEncoder();
+        const table = new Uint32Array(256);
+        for (let i = 0; i < 256; i++) {
+            let crc = i;
+            for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+            table[i] = crc >>> 0;
+        }
+        const now = new Date();
+        const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+        const dosDate = ((Math.max(1980, Math.min(2107, now.getFullYear())) - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+        const localParts = [], centralParts = [], used = new Set();
+        let offset = 0, centralSize = 0;
+        const entries = [{ filename: '', content: '' }, ...files];
+        for (const [index, file] of entries.entries()) {
+            let filename = '';
+            if (index) {
+                let suffix = 0;
+                do { filename = batchFilename(file.filename, suffix++); } while (used.has(filename.toLowerCase()));
+                used.add(filename.toLowerCase());
+            }
+            const name = encoder.encode(`${folder}/${filename}`);
+            const data = encoder.encode(file.content);
+            if (name.length > 65535 || offset + data.length > 128 * 1024 * 1024) throw new Error('打包内容超过 128MB，请减少选择的视频数量。');
+            let crc = 0xffffffff;
+            for (let i = 0; i < data.length; i++) {
+                crc = (crc >>> 8) ^ table[(crc ^ data[i]) & 0xff];
+                if (i && i % 1048576 === 0) await new Promise(resolve => setTimeout(resolve, 0));
+            }
+            crc = (crc ^ 0xffffffff) >>> 0;
+            const local = new Uint8Array(30 + name.length), l = new DataView(local.buffer);
+            l.setUint32(0, 0x04034b50, true); l.setUint16(4, 20, true); l.setUint16(6, 0x0800, true);
+            l.setUint16(10, dosTime, true); l.setUint16(12, dosDate, true); l.setUint32(14, crc, true);
+            l.setUint32(18, data.length, true); l.setUint32(22, data.length, true); l.setUint16(26, name.length, true);
+            local.set(name, 30);
+            const central = new Uint8Array(46 + name.length), c = new DataView(central.buffer);
+            c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true);
+            c.setUint16(12, dosTime, true); c.setUint16(14, dosDate, true); c.setUint32(16, crc, true);
+            c.setUint32(20, data.length, true); c.setUint32(24, data.length, true); c.setUint16(28, name.length, true);
+            c.setUint32(38, index ? 0 : 0x10, true); c.setUint32(42, offset, true); central.set(name, 46);
+            localParts.push(local, data); centralParts.push(central);
+            offset += local.length + data.length; centralSize += central.length;
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }
+        const end = new Uint8Array(22), e = new DataView(end.buffer);
+        e.setUint32(0, 0x06054b50, true); e.setUint16(8, entries.length, true); e.setUint16(10, entries.length, true);
+        e.setUint32(12, centralSize, true); e.setUint32(16, offset, true);
+        return new Blob([...localParts, ...centralParts, end], { type: 'application/zip' });
+    }
+
+    function downloadBatchZip(blob, name) {
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `${name}.zip`;
+        document.body.append(link);
+        link.click();
+        link.remove();
+        // Firefox may begin consuming the Blob after the click handler returns.
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
     }
 
     function showBatchDownloadModal() {
@@ -1682,25 +1776,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             const startButton = modal.querySelector('#start-batch-download');
             if (startButton.disabled) return;
             startButton.disabled = true;
-            const destination = await chooseBatchDirectory();
+            const destination = await chooseBatchDestination();
             if (!destination || !modal.isConnected) {
                 startButton.disabled = false;
                 return;
             }
             let completed = 0;
+            const files = [];
             showToast(`开始下载 ${selectedVideos.length} 个视频的字幕...`, 'info');
 
             for (const video of selectedVideos) {
                 try {
-                    if (await downloadVideoSubtitle(video, format, settings, (content, filename, mimeType) =>
-                        saveSubtitleToDirectory(destination.directory, content, filename, mimeType))) completed++;
+                    if (await downloadVideoSubtitle(video, format, settings, (content, filename, mimeType) => {
+                        if (destination.mode === 'zip') { files.push({ content, filename }); return; }
+                        return saveSubtitleToDirectory(destination.directory, content, filename, mimeType);
+                    })) completed++;
+                    startButton.textContent = `正在处理 ${selectedVideos.indexOf(video) + 1}/${selectedVideos.length}`;
                     await new Promise(resolve => setTimeout(resolve, 500));
                 } catch (error) {
                     console.error(`下载 ${video.bvid} 字幕失败:`, error);
                 }
             }
 
-            showToast(`已保存到「${destination.name}」：${completed}/${selectedVideos.length}；未完成 ${selectedVideos.length - completed} 个`, completed === selectedVideos.length ? 'success' : 'warning', 6000);
+            if (destination.mode === 'zip' && completed) {
+                try {
+                    startButton.textContent = '正在打包…';
+                    downloadBatchZip(await buildBatchZip(destination.name, files), destination.name);
+                } catch (error) {
+                    showToast(`ZIP 打包失败：${error.message}`, 'error', 6000);
+                    startButton.disabled = false;
+                    startButton.textContent = '开始下载';
+                    return;
+                }
+            }
+            const result = destination.mode === 'zip' ? (completed ? '已生成 ZIP' : '未生成 ZIP（没有可用字幕）') : '已保存到文件夹';
+            showToast(`${result}「${destination.name}」：${completed}/${selectedVideos.length}；未完成 ${selectedVideos.length - completed} 个`, completed === selectedVideos.length ? 'success' : 'warning', 6000);
             // A closed old batch must never close a newly opened selection dialog.
             if (document.getElementById(modal.id) === modal) removeModal(modal.id);
         }

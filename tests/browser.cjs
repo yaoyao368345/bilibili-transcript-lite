@@ -195,6 +195,31 @@ const exposed = source.replace(/\}\)\(\);\s*$/, `window.testAPI = { state, ui, c
  assert.deepEqual(await page.evaluate(()=>{
    const files=window.savedFolders.get('Linux 学习字幕').files;return [files.get('同名.txt'),files.get('同名 (2).txt')];
  }),['first','second']);
+ // Firefox-compatible path: no directory API, ZIP must be the default and produce one download.
+ await page.evaluate(()=>{window.savedPicker=window.showDirectoryPicker;window.showDirectoryPicker=undefined;});
+ await page.click('[data-action="batch"]');
+ await page.click('#deselect-all');
+ await page.locator('#video-checkboxes input').nth(8).check();
+ await page.locator('#video-checkboxes input').nth(9).check();
+ const beforeZip=await page.evaluate(()=>({count:window.exports.length,pickers:window.pickerCalls}));
+ await page.click('#start-batch-download');
+ assert.equal(await page.locator('#batch-save-mode').inputValue(),'zip');
+ assert.equal(await page.locator('#batch-save-mode option[value="directory"]').isDisabled(),true);
+ await page.fill('#batch-folder-name','中文学习资料');
+ await page.click('#confirm-batch-name');
+ await page.waitForSelector('#batch-download-modal',{state:'detached'});
+ const zip=await page.evaluate(async()=>({count:window.exports.length,pickers:window.pickerCalls,name:window.lastFilename,
+   type:window.exports.at(-1).type,bytes:Array.from(new Uint8Array(await window.exports.at(-1).arrayBuffer()))}));
+ assert.equal(zip.count,beforeZip.count+1);assert.equal(zip.pickers,beforeZip.pickers);
+ assert.equal(zip.name,'中文学习资料.zip');assert.equal(zip.type,'application/zip');
+ assert.deepEqual(zip.bytes.slice(0,4),[80,75,3,4]);
+ const eocd=Buffer.from(zip.bytes.slice(-22));assert.equal(eocd.readUInt16LE(10),3);
+ await page.evaluate(()=>window.showDirectoryPicker=window.savedPicker);
+ await page.click('[data-action="batch"]');await page.click('#start-batch-download');
+ assert.equal(await page.locator('#batch-save-mode').inputValue(),'directory');
+ await page.selectOption('#batch-save-mode','zip');
+ assert((await page.locator('#batch-save-hint').textContent()).includes('ZIP'));
+ await page.click('#cancel-batch-name');await page.click('#close-batch-modal');
  for(const format of ['txt','md','csv','xml','html','srt','vtt','ass','lrc','json']) {
    const output=await page.evaluate(async format=>{
      await testAPI.downloadVideoSubtitle({bvid:'BV1owrpYKEtP',cid:'27694665372'},format,testAPI.StorageManager.getDownloadSettings());

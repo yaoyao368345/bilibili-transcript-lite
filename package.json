@@ -1,13 +1,14 @@
 {
   "name": "bilibili-transcript-lite",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "description": "Bilibili transcript userscript with lightweight native UI",
   "scripts": {
     "check": "node --check bilibili-transcript.user.js",
     "test:business": "node tests/business.cjs",
     "test:browser": "node tests/browser.cjs",
-    "test": "npm run check && npm run test:business && npm run test:browser"
+    "test:zip": "node tests/zip.cjs",
+    "test": "npm run check && npm run test:business && npm run test:zip && npm run test:browser"
   },
   "devDependencies": {
     "playwright": "1.62.1"
