@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站字幕提取器
 // @namespace    https://blog.qitongtingyu.online/
-// @version      1.0.1
+// @version      1.0.2
 // @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
 // @author       栖桐听雨
 // @match        https://www.bilibili.com/video/*
@@ -1479,6 +1479,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                             </div>
                         </div>
                         <div id="video-checkboxes" class="checkbox-list"></div>
+                        <div id="batch-selection-count" aria-live="polite"></div>
                     </div>
                     <div class="batch-section">
                         <h3>字幕语言</h3>
@@ -1544,17 +1545,40 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 const checkbox = document.createElement('label');
                 checkbox.className = 'checkbox-item';
                 const title = video.title || '未知标题';
-                checkbox.innerHTML = `<input type="checkbox" value="${video.bvid}" data-cid="${video.cid || ''}" checked> ${index + 1}. ${sanitizeInput(title).substring(0, 40)}${title.length > 40 ? '...' : ''}`;
+                const input = document.createElement('input');
+                input.type = 'checkbox';
+                input.value = video.bvid;
+                input.dataset.cid = video.cid || '';
+                input.checked = true;
+                const titleSpan = document.createElement('span');
+                titleSpan.className = 'batch-video-title';
+                titleSpan.textContent = `${index + 1}. ${title}`;
+                const status = document.createElement('span');
+                status.className = 'batch-selection-state';
+                status.setAttribute('aria-hidden', 'true');
+                checkbox.append(input, titleSpan, status);
                 videoCheckboxes.appendChild(checkbox);
             });
         }
 
+        const updateBatchSelection = () => {
+            const inputs = Array.from(videoCheckboxes.querySelectorAll('input'));
+            inputs.forEach(input => {
+                input.parentElement.querySelector('.batch-selection-state').textContent = input.checked ? '已选' : '未选';
+            });
+            document.getElementById('batch-selection-count').textContent = `已选择 ${inputs.filter(input => input.checked).length} / ${inputs.length} 个视频`;
+        };
+        videoCheckboxes.addEventListener('change', updateBatchSelection);
+        updateBatchSelection();
+
         document.getElementById('select-all').addEventListener('click', () => {
             document.querySelectorAll('#video-checkboxes input').forEach(cb => cb.checked = true);
+            updateBatchSelection();
         });
 
         document.getElementById('deselect-all').addEventListener('click', () => {
             document.querySelectorAll('#video-checkboxes input').forEach(cb => cb.checked = false);
+            updateBatchSelection();
         });
 
         document.getElementById('start-batch-download').addEventListener('click', batchDownloadSubtitles);
@@ -2329,6 +2353,72 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     font-size: 14px;
     line-height: 1.5;
     font-weight: 400;
+}
+
+/* A版：批量下载暖色高对比度，仅作用于批量弹窗。 */
+#batch-download-modal {
+    --text-primary: #352a25;
+    --text-secondary: #65554b;
+    --text-muted: #65554b;
+    --bg-primary: #fffdfb;
+    --bg-white: #fffdfb;
+    --bg-secondary: #fff8ef;
+    --bg-surface: #fff0dc;
+    --border: #d6c7bb;
+    --primary: #79442b;
+    --primary-dark: #60341f;
+    color: #352a25;
+    color-scheme: light;
+}
+#batch-download-modal .modal-content { background: #fffdfb; color: #352a25; }
+#batch-download-modal .modal-header { background: #ead9cc; color: #352a25; }
+#batch-download-modal .modal-header h2 { color: #352a25; }
+#batch-download-modal .close-btn { background: #fffdfb; color: #79442b; }
+#batch-download-modal .batch-header { gap: 12px; flex-wrap: wrap; }
+#batch-download-modal .btn-small { background: #fffdfb; color: #352a25; border: 1px solid #d6c7bb; }
+#batch-download-modal .btn-small:hover { background: #fff0dc; border-color: #79442b; }
+#batch-download-modal .checkbox-list {
+    background: #fff8ef;
+    border: 1px solid #d6c7bb;
+    padding: 8px;
+    display: grid;
+    gap: 8px;
+    scrollbar-color: #94735d #fff8ef;
+}
+#batch-download-modal .checkbox-item {
+    background: #fffdfb;
+    color: #352a25;
+    border: 1px solid #d6c7bb;
+    padding: 12px;
+    min-height: 52px;
+    box-sizing: border-box;
+    transition: background-color 0.15s, border-color 0.15s;
+}
+#batch-download-modal .checkbox-item:has(input:checked) {
+    background: #fff0dc;
+    border-color: #79442b;
+    box-shadow: inset 3px 0 #79442b;
+}
+#batch-download-modal .checkbox-item:hover { background: #f9e4c8; border-color: #79442b; }
+#batch-download-modal .checkbox-item:focus-within { outline: 2px solid #79442b; outline-offset: 1px; }
+#batch-download-modal .checkbox-item input { width: 19px; height: 19px; accent-color: #79442b; margin: 0; }
+#batch-download-modal .checkbox-item .batch-video-title {
+    color: #352a25;
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    font-size: 14px;
+    line-height: 1.5;
+}
+#batch-download-modal .checkbox-item .batch-selection-state { color: #65554b; font-size: 12px; flex-shrink: 0; }
+#batch-download-modal .checkbox-item:has(input:checked) .batch-selection-state { color: #79442b; font-weight: 600; }
+#batch-selection-count { color: #65554b; margin-top: 10px; font-size: 13px; }
+#batch-download-modal .checkbox-list::-webkit-scrollbar-thumb { background: #94735d; }
+#batch-download-modal .checkbox-list::-webkit-scrollbar-track { background: #fff8ef; }
+@media (max-width: 480px) {
+    #batch-download-modal .checkbox-item { padding: 10px; gap: 8px; }
+    #batch-download-modal .batch-selection-state { display: none; }
 }
 
 /* 下载确认弹窗 */
