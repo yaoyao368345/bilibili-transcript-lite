@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站字幕提取器
 // @namespace    https://blog.qitongtingyu.online/
-// @version      1.0.2
+// @version      1.1.0
 // @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
 // @author       栖桐听雨
 // @match        https://www.bilibili.com/video/*
@@ -99,10 +99,10 @@
         getDownloadSettings() {
             try {
                 const saved = localStorage.getItem(CONFIG.STORAGE_KEYS.DOWNLOAD_SETTINGS);
-                return saved ? JSON.parse(saved) : CONFIG.DEFAULT_DOWNLOAD_SETTINGS;
+                return { ...CONFIG.DEFAULT_DOWNLOAD_SETTINGS, ...(saved ? JSON.parse(saved) : {}) };
             } catch (error) {
                 console.error('加载下载设置失败:', error);
-                return CONFIG.DEFAULT_DOWNLOAD_SETTINGS;
+                return { ...CONFIG.DEFAULT_DOWNLOAD_SETTINGS };
             }
         },
 
@@ -121,26 +121,25 @@
         videoListType: 'single',
         subtitleList: [],
         subtitleDetails: [],
-        modalOpenCount: 0,
         searchResults: [],
         currentSearchIndex: -1
     };
 
+    let savedOverflow = null;
     function disableScroll() {
-        state.modalOpenCount++;
-        if (state.modalOpenCount === 1) {
-            document.documentElement.style.setProperty('overflow', 'hidden', 'important');
-            document.body.style.setProperty('overflow', 'hidden', 'important');
-        }
+        if (savedOverflow) return;
+        savedOverflow = [document.documentElement, document.body].map(element => ({
+            element, value: element.style.getPropertyValue('overflow'), priority: element.style.getPropertyPriority('overflow')
+        }));
+        savedOverflow.forEach(({element}) => element.style.setProperty('overflow', 'hidden', 'important'));
     }
-
     function enableScroll() {
-        state.modalOpenCount--;
-        if (state.modalOpenCount <= 0) {
-            state.modalOpenCount = 0;
-            document.documentElement.style.removeProperty('overflow');
-            document.body.style.removeProperty('overflow');
-        }
+        if (document.querySelector('.bili-transcript-modal') || !savedOverflow) return;
+        savedOverflow.forEach(({element, value, priority}) => {
+            if (value) element.style.setProperty('overflow', value, priority);
+            else element.style.removeProperty('overflow');
+        });
+        savedOverflow = null;
     }
 
     class SubtitleCache {
@@ -210,20 +209,14 @@
     const deduplicator = new RequestDeduplicator();
 
     function showToast(message, type = 'info', duration = 3000) {
+        document.querySelector('.bili-transcript-toast')?.remove();
         const toast = document.createElement('div');
-        toast.className = `bili-transcript-toast bili-transcript-toast-${type}`;
-        const icons = {
-            success: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>',
-            error: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg>',
-            warning: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M12 9v4M12 17h.01"/><path d="M12 22c5.523 0 10-4.477 10-10S17.523 2 12 2 2 6.477 2 12s4.477 10 10 10z"/></svg>',
-            info: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/></svg>'
-        };
-        toast.innerHTML = `<span class="toast-icon">${icons[type]}</span><span class="toast-message">${message}</span>`;
-        document.body.appendChild(toast);
-        setTimeout(() => {
-            toast.style.animation = 'slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1)';
-            setTimeout(() => document.body.contains(toast) && toast.remove(), 300);
-        }, duration);
+        toast.className = 'bili-transcript-toast';
+        toast.setAttribute('role', type === 'error' ? 'alert' : 'status');
+        const icons = { success: '✓', error: '✕', warning: '⚠', info: 'ⓘ' };
+        toast.textContent = `${icons[type] || icons.info} ${message}`;
+        document.body.append(toast);
+        setTimeout(() => toast.remove(), duration);
     }
 
     function sanitizeInput(input) {
@@ -400,6 +393,17 @@
     }
 
     // 格式转换函数
+    function convertToMD(content, includeTime = false) {
+        const escape = text => String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/([\\`*_{}\[\]()#+.!|~-])/g, '\\$1');
+        return content.map(item => `${includeTime ? formatTime(item.from, 'srt') + ' ' : ''}${escape(item.content)}`).join('  \n');
+    }
+
+    function convertToHTML(content, includeTime = false) {
+        return '<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>字幕</title><body>' +
+            content.map(item => `<p>${includeTime ? formatTime(item.from, 'srt') + ' ' : ''}${sanitizeInput(item.content)}</p>`).join('\n') + '</body></html>';
+    }
+
     function convertToSRT(content) {
         return content.map((item, index) => {
             const from = formatTime(item.from, 'srt');
@@ -607,103 +611,136 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         return durationRatio < 0.5 || durationRatio > 1.5;
     }
 
-    // 字幕搜索功能
-    function searchSubtitles(keyword) {
-        if (!keyword?.trim()) {
-            state.searchResults = [];
-            state.currentSearchIndex = -1;
-            renderSubtitles(state.subtitleDetails);
-            return;
-        }
+    // Subtitle rendering and search. Each modal owns one abortable event scope.
+    const ui = { controller: null, timer: null, rows: [], texts: [], keyword: '', selected: null,
+        matches: new Set(), revision: 0, navigation: 0, scrollFrame: null, more: null };
 
-        const lowerKeyword = keyword.toLowerCase();
-        state.searchResults = state.subtitleDetails.filter(item =>
-            item.content.toLowerCase().includes(lowerKeyword)
-        );
-        state.currentSearchIndex = state.searchResults.length > 0 ? 0 : -1;
-
-        renderSubtitlesWithHighlight(keyword);
+    function clearSubtitleView() {
+        clearTimeout(ui.timer);
+        cancelAnimationFrame(ui.scrollFrame);
+        ui.scrollFrame = null;
+        ++ui.revision;
+        ++ui.navigation;
+        ui.matches = new Set();
+        ui.more = null;
+        ui.rows = [];
+        ui.texts = [];
+        ui.keyword = '';
+        ui.selected = null;
+        state.searchResults = [];
+        state.currentSearchIndex = -1;
+        const input = document.getElementById('subtitle-search');
+        if (input) input.value = '';
         updateSearchStatus();
-
-        if (state.searchResults.length > 0) {
-            scrollToSearchResult(0);
-        } else {
-            showToast('未找到匹配的字幕', 'info');
-        }
     }
 
-    function renderSubtitlesWithHighlight(keyword) {
-        const container = document.getElementById('subtitle-content');
-        if (!container) return;
+    function searchSubtitles(keyword) {
+        const query = keyword.trim().toLowerCase();
+        if (query === ui.keyword) return;
+        ui.keyword = query;
+        ++ui.revision;
+        ++ui.navigation;
+        state.searchResults = [];
+        ui.texts.forEach((text, index) => {
+            if (query && text.includes(query)) state.searchResults.push(index);
+        });
+        state.currentSearchIndex = state.searchResults.length ? 0 : -1;
+        ui.matches = new Set(state.searchResults);
+        renderSubtitlesWithHighlight(query);
+        updateSearchStatus();
+        if (state.searchResults.length) scrollToSearchResult(0);
+    }
 
-        if (!state.subtitleDetails?.length) {
-            showNoSubtitles();
-            return;
+    function updateRowHighlight(row, index, keyword) {
+            const matched = ui.matches.has(index);
+            row.classList.toggle('search-match', matched);
+            const text = row.querySelector('.subtitle-text');
+            const nextHighlight = matched ? keyword : '';
+            if (text.dataset.highlight === nextHighlight) return;
+            text.dataset.highlight = nextHighlight;
+            const original = String(state.subtitleDetails[index].content);
+            const fragment = document.createDocumentFragment();
+            let offset = 0;
+            // Literal search: subtitle text is never interpreted as HTML or a regexp.
+            while (nextHighlight) {
+                const position = ui.texts[index].indexOf(nextHighlight, offset);
+                if (position < 0) break;
+                fragment.append(document.createTextNode(original.slice(offset, position)));
+                const mark = document.createElement('mark');
+                mark.textContent = original.slice(position, position + nextHighlight.length);
+                fragment.append(mark);
+                offset = position + nextHighlight.length;
+            }
+            fragment.append(document.createTextNode(original.slice(offset)));
+            text.replaceChildren(fragment);
+    }
+
+    async function renderSubtitlesWithHighlight(keyword) {
+        // Yield between batches even after the user has scrolled through a very long list.
+        const revision = ui.revision;
+        ui.selected?.classList.remove('search-selected');
+        ui.selected = null;
+        for (let start = 0; start < ui.rows.length; start += 200) {
+            if (revision !== ui.revision) return;
+            for (let index = start; index < Math.min(start + 200, ui.rows.length); index++) {
+                updateRowHighlight(ui.rows[index], index, keyword);
+            }
+            if (start + 200 < ui.rows.length) await new Promise(resolve => setTimeout(resolve, 0));
         }
-
-        const lowerKeyword = keyword.toLowerCase();
-        const subtitleHtml = state.subtitleDetails.map((item, index) => {
-            const time = formatTime(item.from);
-            const isHighlighted = item.content.toLowerCase().includes(lowerKeyword);
-            const highlightedContent = item.content.replace(
-                new RegExp(`(${keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi'),
-                '<span class="highlight">$1</span>'
-            );
-
-            return `
-                <div class="subtitle-item ${isHighlighted ? 'search-match' : ''}" data-index="${index}" data-time="${item.from}">
-                    <span class="subtitle-time">[${time}]</span>
-                    <span class="subtitle-text">${highlightedContent}</span>
-                </div>
-            `;
-        }).join('');
-
-        container.innerHTML = `<div class="subtitle-list">${subtitleHtml}</div>`;
-        bindSubtitleClickEvents();
     }
 
     function updateSearchStatus() {
-        const statusEl = document.getElementById('search-status');
-        if (!statusEl) return;
-        statusEl.textContent = state.searchResults.length === 0
-            ? '0/0'
-            : `${state.currentSearchIndex + 1}/${state.searchResults.length}`;
+        const status = document.getElementById('search-status');
+        if (status) status.textContent = state.searchResults.length
+            ? `${state.currentSearchIndex + 1}/${state.searchResults.length}` : '0/0';
     }
 
-    function scrollToSearchResult(index) {
-        if (index < 0 || index >= state.searchResults.length) return;
-
-        const result = state.searchResults[index];
-        const itemIndex = state.subtitleDetails.indexOf(result);
-        const item = document.querySelector(`.subtitle-item[data-index="${itemIndex}"]`);
-
-        if (item) {
-            document.querySelectorAll('.subtitle-item.search-selected').forEach(el => el.classList.remove('search-selected'));
-            item.classList.add('search-selected');
-            item.scrollIntoView({ behavior: 'smooth', block: 'center' });
-
-            const video = document.querySelector('video');
-            const time = parseFloat(item.getAttribute('data-time'));
-            if (video && !isNaN(time)) video.currentTime = time;
+    async function scrollToSearchResult(index) {
+        const rowIndex = state.searchResults[index];
+        if (!Number.isInteger(rowIndex)) return;
+        const navigation = ++ui.navigation;
+        // Search indexes all data; load distant matches incrementally without one long task.
+        while (rowIndex >= ui.rows.length) {
+            appendSubtitleBatch();
+            await new Promise(resolve => setTimeout(resolve, 0));
+            if (navigation !== ui.navigation) return;
         }
+        const row = ui.rows[rowIndex];
+        if (!row) return;
+        ui.selected?.classList.remove('search-selected');
+        ui.selected = row;
+        row.classList.add('search-selected');
+        const container = document.getElementById('subtitle-content');
+        container.scrollTop += row.getBoundingClientRect().top - container.getBoundingClientRect().top
+            - container.clientHeight / 2 + row.offsetHeight / 2;
+        const video = document.querySelector('video');
+        const time = Number(row.dataset.time);
+        if (video && Number.isFinite(time)) video.currentTime = time;
     }
 
     function nextSearchResult() {
-        if (state.searchResults.length === 0) return;
+        if (!state.searchResults.length) return;
         state.currentSearchIndex = (state.currentSearchIndex + 1) % state.searchResults.length;
         updateSearchStatus();
         scrollToSearchResult(state.currentSearchIndex);
     }
 
     function prevSearchResult() {
-        if (state.searchResults.length === 0) return;
+        if (!state.searchResults.length) return;
         state.currentSearchIndex = (state.currentSearchIndex - 1 + state.searchResults.length) % state.searchResults.length;
         updateSearchStatus();
         scrollToSearchResult(state.currentSearchIndex);
     }
 
+
     async function loadSubtitles(retryCount = 0) {
         const generation = ++loadGeneration;
+        clearSubtitleView();
+        state.subtitleDetails = [];
+        state.subtitleList = [];
+        showSubtitlesSelector([]);
+        const target = document.getElementById('subtitle-content');
+        if (target) target.textContent = '加载中…';
         const isStale = () => generation !== loadGeneration;
         try {
             const resolved = await resolveVideo({ ...state.currentVideo });
@@ -713,7 +750,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             showVideoListSelector();
             updateVideoInfo();
         } catch (error) {
-            if (!isStale()) showToast(error.message || '读取分P信息失败', 'error');
+            if (!isStale()) {
+                if (target) target.textContent = '读取分P信息失败，请重新选择视频或重新打开窗口。';
+                showToast(error.message || '读取分P信息失败', 'error');
+            }
             return;
         }
         state.subtitleDetails = [];
@@ -759,7 +799,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
             state.subtitleList = subtitles;
             showVideoListSelector();
-            showSubtitlesSelector(subtitles);
+            // Keep language selection disabled until automatic selection completes.
 
             const sortedSubtitles = sortSubtitles(subtitles);
             let selectedSubtitle = null;
@@ -810,6 +850,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             }
 
             state.subtitleDetails = content;
+            showSubtitlesSelector(subtitles, selectedSubtitle.id);
             renderSubtitles(content);
             updateVideoInfo();
             showToast('字幕加载完成', 'success');
@@ -817,6 +858,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         } catch (error) {
             if (isStale()) return;
             console.error('加载字幕失败:', error);
+            if (target) target.textContent = '字幕加载失败，请重新选择视频或重新打开窗口。';
             showToast('加载字幕失败', 'error');
         }
     }
@@ -839,251 +881,223 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         `;
     }
 
+    // Native selectors: update options, keep their event handlers on the modal.
     function showVideoListSelector() {
-        const container = document.getElementById('video-list-selector');
-        if (!container) return;
-
-        const videoList = state.videoList;
-        if (!videoList || videoList.length <= 1) {
-            container.innerHTML = '';
-            return;
-        }
-
-        const currentBvid = state.currentVideo.bvid;
-        const options = videoList.map((video, index) => {
-            const isSelected = video.bvid === currentBvid && String(video.cid) === String(state.currentVideo.cid);
-            return `<option value="${index}" data-cid="${video.cid}" ${isSelected ? 'selected' : ''}>${index + 1}. ${sanitizeInput(video.title).substring(0, 30)}${video.title.length > 30 ? '...' : ''}</option>`;
-        }).join('');
-
-        container.innerHTML = `<select id="video-select" class="video-select">${options}</select>`;
-
-        document.getElementById('video-select')?.addEventListener('change', async (e) => {
-            const video = videoList[Number(e.target.value)];
-            if (video) {
-                state.currentVideo = { ...video, page: video.page || 1 };
-
-                await loadSubtitles();
-            }
-        });
+        const select = document.getElementById('video-select');
+        if (!select) return;
+        const list = state.videoList;
+        select.replaceChildren(...list.map((video, index) => {
+            const option = document.createElement('option');
+            option.value = index;
+            option.textContent = video.title;
+            option.selected = video.bvid === state.currentVideo.bvid && String(video.cid) === String(state.currentVideo.cid);
+            return option;
+        }));
+        select.parentElement.hidden = list.length <= 1;
+        document.getElementById('batch-download').disabled = list.length === 0;
     }
 
-    function showSubtitlesSelector(subtitles) {
-        const container = document.getElementById('subtitle-selector');
-        if (!container) return;
-
-        if (!subtitles || subtitles.length <= 1) {
-            container.innerHTML = '';
-            return;
-        }
-
-        const options = subtitles.map((subtitle, index) => {
-            const hasUrl = subtitle.url?.trim();
-            return `<div class="custom-select-option" data-value="${index}" ${!hasUrl ? 'class="custom-select-option disabled"' : ''}>${subtitle.lan}${hasUrl ? '' : ' (不可用)'}</div>`;
-        }).join('');
-
-        const defaultIndex = subtitles.findIndex(s => s.url?.trim());
-        const defaultSubtitle = subtitles[defaultIndex >= 0 ? defaultIndex : 0];
-
-        container.innerHTML = `
-            <div class="custom-select">
-                <div class="custom-select-trigger" id="subtitle-select-trigger">
-                    <span class="custom-select-value">${defaultSubtitle.lan}</span>
-                    <span class="custom-select-icon-wrapper">
-                        <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-                    </span>
-                </div>
-                <div class="custom-select-dropdown" id="subtitle-select-dropdown">${options}</div>
-            </div>
-        `;
-
-        const customSelect = container.querySelector('.custom-select');
-        const trigger = document.getElementById('subtitle-select-trigger');
-        const dropdown = document.getElementById('subtitle-select-dropdown');
-        const valueSpan = trigger.querySelector('.custom-select-value');
-
-        const toggleDropdown = () => {
-            dropdown.classList.toggle('active');
-            customSelect.classList.toggle('active');
-        };
-
-        trigger.addEventListener('click', toggleDropdown);
-        document.addEventListener('click', (e) => !container.contains(e.target) && dropdown.classList.remove('active') && customSelect.classList.remove('active'));
-
-        dropdown.querySelectorAll('.custom-select-option:not(.disabled)').forEach(option => {
-            option.addEventListener('click', async () => {
-                const index = parseInt(option.dataset.value);
-                const subtitle = subtitles[index];
-                if (subtitle?.url) {
-                    valueSpan.textContent = subtitle.lan;
-                    dropdown.classList.remove('active');
-                    customSelect.classList.remove('active');
-                    const content = await getSubtitleContent(subtitle.url, state.currentVideo.bvid, state.currentVideo.cid, subtitle.id);
-                    state.subtitleDetails = content;
-                    state.searchResults = [];
-                    state.currentSearchIndex = -1;
-                    renderSubtitles(content);
-                }
-            });
-        });
-    }
-
-    function bindSubtitleClickEvents() {
-        document.querySelectorAll('.subtitle-item').forEach(item => {
-            item.addEventListener('click', () => {
-                const video = document.querySelector('video');
-                const time = parseFloat(item.getAttribute('data-time'));
-                if (video && !isNaN(time)) {
-                    video.currentTime = time;
-                    video.play();
-                }
-            });
-        });
+    function showSubtitlesSelector(subtitles, selectedId) {
+        const select = document.getElementById('subtitle-select');
+        if (!select) return;
+        select.replaceChildren(...subtitles.map((subtitle, index) => {
+            const option = document.createElement('option');
+            option.value = index;
+            option.textContent = subtitle.lan + (subtitle.url ? '' : '（不可用）');
+            option.disabled = !subtitle.url;
+            option.selected = String(subtitle.id) === String(selectedId);
+            return option;
+        }));
+        select.disabled = !subtitles.some(subtitle => subtitle.url);
     }
 
     function renderSubtitles(content) {
+        clearSubtitleView();
         const container = document.getElementById('subtitle-content');
         if (!container) return;
+        if (!content?.length) { showNoSubtitles(); return; }
+        ui.texts = content.map(item => String(item.content).toLowerCase());
+        container.replaceChildren();
+        ui.more = document.createElement('button');
+        ui.more.type = 'button';
+        ui.more.className = 'subtitle-more';
+        ui.more.dataset.loadMore = 'true';
+        container.append(ui.more);
+        appendSubtitleBatch(content.length <= 500 ? content.length : 200);
+    }
 
-        if (!content?.length) {
-            showNoSubtitles();
-            return;
+    function appendSubtitleBatch(count = 200) {
+        const container = document.getElementById('subtitle-content');
+        if (!container || !ui.more) return;
+        const fragment = document.createDocumentFragment();
+        const end = Math.min(ui.rows.length + count, state.subtitleDetails.length);
+        for (let index = ui.rows.length; index < end; index++) {
+            const item = state.subtitleDetails[index];
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'subtitle-item';
+            row.dataset.index = index;
+            row.dataset.time = item.from;
+            const time = document.createElement('span');
+            time.className = 'subtitle-time';
+            time.textContent = formatTime(item.from).split(',')[0].replace(/^00:/, '');
+            const text = document.createElement('span');
+            text.className = 'subtitle-text';
+            text.dataset.highlight = '';
+            text.textContent = item.content;
+            row.append(time, text);
+            updateRowHighlight(row, index, ui.keyword);
+            ui.rows.push(row);
+            fragment.append(row);
         }
-
-        const subtitleHtml = content.map((item, index) => {
-            const time = formatTime(item.from);
-            return `
-                <div class="subtitle-item" data-index="${index}" data-time="${item.from}">
-                    <span class="subtitle-time">[${time}]</span>
-                    <span class="subtitle-text">${sanitizeInput(item.content)}</span>
-                </div>
-            `;
-        }).join('');
-
-        container.innerHTML = `<div class="subtitle-list">${subtitleHtml}</div>`;
-        bindSubtitleClickEvents();
+        container.insertBefore(fragment, ui.more);
+        ui.more.hidden = ui.rows.length >= state.subtitleDetails.length;
+        ui.more.textContent = `已加载 ${ui.rows.length} / ${state.subtitleDetails.length} 条 · 加载更多`;
     }
 
     function updateVideoInfo() {
-        const { bvid, cid, title, duration } = state.currentVideo;
-        document.getElementById('video-title').textContent = sanitizeInput(title) || '未知标题';
-        document.getElementById('video-bvid').textContent = bvid || '未知';
-        document.getElementById('video-cid').textContent = cid || '未知';
-        document.getElementById('video-duration').textContent = duration ? formatTime(duration) : '未知';
+        const title = document.getElementById('video-title');
+        if (title) title.textContent = state.currentVideo.title || '读取视频信息…';
+        const details = document.getElementById('video-details');
+        if (details) details.textContent = `BV：${state.currentVideo.bvid || '未知'}\nCID：${state.currentVideo.cid || '未知'}\n时长：${formatTime(state.currentVideo.duration || 0)}`;
     }
 
     function createModal() {
-        state.currentVideo = getCurrentVideoInfo();
         removeModal('bili-transcript-modal');
+        state.currentVideo = getCurrentVideoInfo();
         disableScroll();
-
         const modal = document.createElement('div');
         modal.id = 'bili-transcript-modal';
         modal.className = 'bili-transcript-modal';
         modal.innerHTML = `
             <div class="modal-overlay" id="modal-overlay"></div>
-            <div class="modal-content">
-                <div class="modal-header">
-                    <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="modal-icon"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg> 字幕提取器</h2>
-                    <button id="close-modal" class="close-btn"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
-                </div>
-                <div class="modal-body">
-                    <div class="video-info">
-                        <div class="info-row"><span class="info-label">标题</span><span id="video-title" class="info-value">加载中...</span></div>
-                        <div class="info-row"><span class="info-label">BV号</span><span id="video-bvid" class="info-value">加载中...</span></div>
-                        <div class="info-row"><span class="info-label">CID</span><span id="video-cid" class="info-value">加载中...</span></div>
-                        <div class="info-row"><span class="info-label">时长</span><span id="video-duration" class="info-value">加载中...</span></div>
+            <section class="modal-content lite-main" role="dialog" aria-modal="true" aria-label="字幕提取器">
+                <header class="modal-header"><h2>字幕提取器 Lite</h2><button id="close-modal" class="close-btn" aria-label="关闭">×</button></header>
+                <div class="lite-controls">
+                    <div id="video-title">读取视频信息…</div>
+                    <div class="lite-selectors">
+                        <label hidden>视频分 P<select id="video-select" aria-label="视频分 P"></select></label>
+                        <label>字幕语言<select id="subtitle-select" aria-label="字幕语言" disabled></select></label>
                     </div>
-                    <div id="video-list-selector" class="selector-container"></div>
-                    <div id="subtitle-selector" class="selector-container"></div>
-
-                    <div class="search-container">
-                        <div class="search-input-wrapper">
-                            <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                <circle cx="11" cy="11" r="8"/>
-                                <line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                            </svg>
-                            <input type="text" id="subtitle-search" class="search-input" placeholder="搜索字幕...">
-                            <div class="search-nav">
-                                <button id="search-prev" class="search-nav-btn" title="上一个">↑</button>
-                                <span id="search-status" class="search-status">0/0</span>
-                                <button id="search-next" class="search-nav-btn" title="下一个">↓</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="subtitle-content-wrapper">
-                        <div id="subtitle-content" class="subtitle-content">
-                            <div class="loading"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" class="loading-spinner"><circle class="loading-path" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-dasharray="50" stroke-dashoffset="0"/></svg> 加载中...</div>
-                        </div>
+                    <div class="search-container"><input id="subtitle-search" type="search" placeholder="搜索字幕…" aria-label="搜索字幕">
+                        <button data-action="prev" aria-label="上一条匹配">↑</button><span id="search-status" aria-live="polite">0/0</span><button data-action="next" aria-label="下一条匹配">↓</button>
                     </div>
                 </div>
-                <div class="modal-footer">
-                    <button id="settings-btn" class="btn-secondary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg> 设置</button>
-                    <button id="copy-text" class="btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg> 复制</button>
-                    <button id="download-txt" class="btn-secondary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 下载</button>
-                    <button id="batch-download" class="btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg> 批量</button>
-                </div>
-            </div>
-        `;
+                <div id="subtitle-content" class="subtitle-content" aria-label="字幕列表">加载中…</div>
+                <footer class="modal-footer"><button data-action="settings" class="btn-secondary">设置</button><div class="footer-actions">
+                    <button data-action="copy" class="btn-secondary">复制</button><button data-action="download" class="btn-primary">下载</button><button id="batch-download" data-action="batch" class="btn-secondary">批量</button>
+                </div></footer>
+            </section>`;
         document.body.appendChild(modal);
-
         setupModalClose(modal, 'close-modal', 'modal-overlay');
-
-        // 绑定搜索事件
-        const searchInput = document.getElementById('subtitle-search');
-        const searchPrev = document.getElementById('search-prev');
-        const searchNext = document.getElementById('search-next');
-
-        searchInput.addEventListener('input', (e) => searchSubtitles(e.target.value));
-        searchInput.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') e.shiftKey ? prevSearchResult() : nextSearchResult();
-        });
-
-        searchPrev.addEventListener('click', prevSearchResult);
-        searchNext.addEventListener('click', nextSearchResult);
-
-        document.getElementById('copy-text').addEventListener('click', async () => {
-            await copyToClipboard(convertToTXT(state.subtitleDetails));
-        });
-
-        document.getElementById('download-txt').addEventListener('click', () => {
-            showDownloadConfirm(state.subtitleDetails, state.subtitleDetails);
-        });
-
-        document.getElementById('settings-btn').addEventListener('click', showSettingsModal);
-
-        const batchBtn = document.getElementById('batch-download');
-        if (batchBtn) {
-            if (state.videoList?.length > 1) {
-                batchBtn.addEventListener('click', showBatchDownloadModal);
-            } else {
-                batchBtn.style.display = 'none';
+        ui.controller = new AbortController();
+        const options = { signal: ui.controller.signal };
+        const input = modal.querySelector('#subtitle-search');
+        let composing = false;
+        const scheduleSearch = () => {
+            clearTimeout(ui.timer);
+            if (composing) return;
+            const value = input.value;
+            ui.timer = setTimeout(() => searchSubtitles(value), 200);
+        };
+        input.addEventListener('compositionstart', () => { composing = true; clearTimeout(ui.timer); }, options);
+        input.addEventListener('compositionend', () => { composing = false; scheduleSearch(); }, options);
+        input.addEventListener('input', scheduleSearch, options);
+        input.addEventListener('keydown', event => {
+            if (event.key !== 'Enter' || composing || event.isComposing) return;
+            event.preventDefault();
+            clearTimeout(ui.timer);
+            if (input.value.trim().toLowerCase() !== ui.keyword) searchSubtitles(input.value);
+            else event.shiftKey ? prevSearchResult() : nextSearchResult();
+        }, options);
+        modal.querySelector('#subtitle-content').addEventListener('click', event => {
+            if (event.target.closest('[data-load-more]')) { appendSubtitleBatch(); return; }
+            const row = event.target.closest('.subtitle-item');
+            if (!row || !event.currentTarget.contains(row)) return;
+            const video = document.querySelector('video');
+            const time = Number(row.dataset.time);
+            if (video && Number.isFinite(time)) {
+                video.currentTime = time;
+                video.play()?.catch(() => {});
             }
-        }
-
+        }, options);
+        modal.querySelector('#subtitle-content').addEventListener('scroll', event => {
+            const container = event.currentTarget;
+            if (ui.scrollFrame !== null) return;
+            ui.scrollFrame = requestAnimationFrame(() => {
+                ui.scrollFrame = null;
+                if (container.scrollHeight - container.scrollTop - container.clientHeight < 150) appendSubtitleBatch();
+            });
+        }, { ...options, passive: true });
+        modal.addEventListener('click', event => {
+            const action = event.target.closest('[data-action]')?.dataset.action;
+            if (action === 'settings') showSettingsModal();
+            if (action === 'copy') copyToClipboard(convertToTXT(state.subtitleDetails));
+            if (action === 'download') showDownloadConfirm(state.subtitleDetails, state.subtitleDetails);
+            if (action === 'batch') showBatchDownloadModal();
+            if (action === 'prev' || action === 'next') {
+                clearTimeout(ui.timer);
+                if (input.value.trim().toLowerCase() !== ui.keyword) searchSubtitles(input.value);
+                else action === 'prev' ? prevSearchResult() : nextSearchResult();
+            }
+        }, options);
+        modal.querySelector('#video-select').addEventListener('change', event => {
+            const video = state.videoList[Number(event.target.value)];
+            if (!video) return;
+            state.currentVideo = { ...video, page: video.page || 1 };
+            loadSubtitles();
+        }, options);
+        modal.querySelector('#subtitle-select').addEventListener('change', async event => {
+            const subtitle = state.subtitleList[Number(event.target.value)];
+            if (!subtitle?.url) return;
+            const generation = ++loadGeneration;
+            const { bvid, cid } = state.currentVideo;
+            clearSubtitleView();
+            state.subtitleDetails = [];
+            modal.querySelector('#subtitle-content').textContent = '加载中…';
+            try {
+                const content = await getSubtitleContent(subtitle.url, bvid, cid, subtitle.id);
+                if (generation !== loadGeneration || !modal.isConnected) return;
+                state.subtitleDetails = content;
+                renderSubtitles(content);
+            } catch (error) {
+                if (generation !== loadGeneration || !modal.isConnected) return;
+                modal.querySelector('#subtitle-content').textContent = '字幕加载失败，请重新选择语言重试。';
+                showToast('字幕加载失败', 'error');
+            }
+        }, options);
+        input.focus();
         loadSubtitles();
     }
 
+    // Modal lifetime: removed controls cannot keep global listeners or pending searches.
     function removeModal(modalId) {
-        const existingModal = document.getElementById(modalId);
-        if (existingModal) {
-            existingModal.remove();
-            if (modalId === 'bili-transcript-modal' || modalId === 'bili-transcript-batch-modal') {
-                enableScroll();
-            }
+        const modal = document.getElementById(modalId);
+        if (!modal) return;
+        if (modalId === 'bili-transcript-modal') {
+            ++loadGeneration;
+            ui.controller?.abort();
+            ui.controller = null;
+            clearSubtitleView();
         }
+        modal.remove();
+        enableScroll();
     }
 
     function setupModalClose(modal, closeBtnId, overlayId) {
-        const closeModal = () => {
-            modal.style.opacity = '0';
-            enableScroll();
-            setTimeout(() => document.body.contains(modal) && modal.remove(), 300);
-        };
-
-        document.getElementById(closeBtnId)?.addEventListener('click', closeModal);
-        document.getElementById(overlayId)?.addEventListener('click', closeModal);
+        const surface = modal.querySelector('.modal-content');
+        surface?.setAttribute('role', 'dialog');
+        surface?.setAttribute('aria-modal', 'true');
+        surface?.setAttribute('aria-label', modal.querySelector('h2')?.textContent.trim() || '字幕工具');
+        modal.querySelector(`#${closeBtnId}`)?.setAttribute('aria-label', '关闭');
+        const close = () => removeModal(modal.id);
+        modal.querySelector(`#${closeBtnId}`)?.addEventListener('click', close);
+        modal.querySelector(`#${overlayId}`)?.addEventListener('click', close);
+        modal.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.stopPropagation(); close(); }
+        });
     }
+
 
     function showDownloadConfirm(content, originalData) {
         removeModal('bili-transcript-download-modal');
@@ -1107,8 +1121,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             <div class="modal-overlay" id="download-overlay"></div>
             <div class="modal-content download-modal">
                 <div class="modal-header">
-                    <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 下载字幕</h2>
-                    <button id="close-download-modal" class="close-btn"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+                    <h2> 下载字幕</h2>
+                    <button id="close-download-modal" class="close-btn">×</button>
                 </div>
                 <div class="modal-body">
                     <div class="download-section">
@@ -1117,10 +1131,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     </div>
                     <div class="download-section">
                         <label class="download-label">输出格式:</label>
-                        <div class="download-format-display">
-                            <span>${settings.format.toUpperCase()}</span>
-                            <span class="format-hint">(可在设置中修改)</span>
-                        </div>
+                        <select id="download-format" aria-label="输出格式">${[...CONFIG.PRESET_EXTENSIONS, ...StorageManager.getCustomExtensions()].map(ext => `<option value="${sanitizeInput(ext.value)}" ${ext.value === settings.format ? 'selected' : ''}>${sanitizeInput(ext.name)}</option>`).join('')}</select>
                     </div>
                     <div class="download-section">
                         <label class="download-label">下载方式:</label>
@@ -1135,8 +1146,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button id="download-settings-btn" class="btn-secondary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg> 设置</button>
-                    <button id="confirm-download" class="btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 确认</button>
+                    <button id="download-settings-btn" class="btn-secondary"> 设置</button>
+                    <button id="confirm-download" class="btn-primary"> 确认</button>
                 </div>
             </div>
         `;
@@ -1171,7 +1182,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         });
 
         document.getElementById('download-settings-btn').addEventListener('click', () => {
-            modal.remove();
+            removeModal(modal.id);
             showSettingsModal();
         });
 
@@ -1194,20 +1205,21 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 case 'xml': convertedContent = convertToXML(content); break;
                 case 'ass': convertedContent = convertToASS(content, state.currentVideo.title); break;
                 case 'lrc': convertedContent = convertToLRC(content); break;
-                case 'html':
-                    convertedContent = settings.includeSubtitleTime
-                        ? content.map(item => `${formatTime(item.from, 'srt')} ${item.content}`).join('<br>\n')
-                        : content.map(item => item.content).join('<br>\n');
-                    break;
+                case 'html': convertedContent = convertToHTML(content, settings.includeSubtitleTime); break;
+                case 'md': convertedContent = convertToMD(content, settings.includeSubtitleTime); break;
                 default:
                     convertedContent = convertToTXT(content, settings.includeSubtitleTime);
             }
 
             const downloadMethod = document.querySelector('input[name="download-method"]:checked').value;
-            modal.remove();
+            removeModal(modal.id);
             handleDownload(convertedContent, filename, mimeType, downloadMethod);
         });
 
+        modal.querySelector('#download-format').addEventListener('change', event => {
+            settings.format = event.target.value;
+            updateFilename();
+        });
         updateFilename();
     }
 
@@ -1227,6 +1239,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     function createCustomExtensionDialog(onSuccess) {
+        removeModal('custom-extension-modal');
+        disableScroll();
         const modal = document.createElement('div');
         modal.id = 'custom-extension-modal';
         modal.className = 'bili-transcript-modal';
@@ -1234,8 +1248,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             <div class="modal-overlay" id="custom-ext-overlay"></div>
             <div class="modal-content custom-ext-modal">
                 <div class="modal-header">
-                    <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 4v16m8-8H4"/></svg> 添加自定义扩展名</h2>
-                    <button id="close-custom-ext-modal" class="close-btn"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+                    <h2> 添加自定义扩展名</h2>
+                    <button id="close-custom-ext-modal" class="close-btn">×</button>
                 </div>
                 <div class="modal-body">
                     <div class="custom-ext-section">
@@ -1257,7 +1271,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         document.body.appendChild(modal);
 
         const closeModal = () => {
-            modal.remove();
+            removeModal(modal.id);
             enableScroll();
         };
 
@@ -1304,10 +1318,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             <div class="modal-overlay" id="settings-overlay"></div>
             <div class="modal-content settings-modal">
                 <div class="modal-header">
-                    <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg> 下载设置</h2>
-                    <button id="close-settings-modal" class="close-btn"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+                    <h2> 下载设置</h2>
+                    <button id="close-settings-modal" class="close-btn">×</button>
                 </div>
                 <div class="modal-body">
+                    <details class="settings-section"><summary>详细信息</summary><div id="video-details"></div></details>
                     <div class="settings-section">
                         <div class="settings-header">
                             <h3>输出格式</h3>
@@ -1315,15 +1330,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                         </div>
                         <div id="format-list" class="format-list">
                             ${CONFIG.PRESET_EXTENSIONS.map(ext => `
-                                <div class="format-item ${settings.format === ext.value ? 'selected' : ''}" data-value="${ext.value}" data-default="true" data-mime="${ext.mimeType}">
-                                    <span class="format-name">${ext.name}</span>
-                                </div>
+                                <label class="format-item" data-value="${ext.value}" data-default="true" data-mime="${ext.mimeType}">
+                                    <input type="radio" name="settings-format" value="${sanitizeInput(ext.value)}" ${settings.format === ext.value ? 'checked' : ''}><span class="format-name">${sanitizeInput(ext.name)}</span>
+                                </label>
                             `).join('')}
                             ${customExtensions.map((ext, index) => `
-                                <div class="format-item ${settings.format === ext.value ? 'selected' : ''}" data-value="${ext.value}" data-custom="true" data-index="${index}" data-mime="${ext.mimeType}">
-                                    <span class="format-name">${ext.name}</span>
+                                <label class="format-item" data-value="${ext.value}" data-custom="true" data-index="${index}" data-mime="${ext.mimeType}">
+                                    <input type="radio" name="settings-format" value="${sanitizeInput(ext.value)}" ${settings.format === ext.value ? 'checked' : ''}><span class="format-name">${sanitizeInput(ext.name)}</span>
                                     <button class="remove-ext-btn">删除</button>
-                                </div>
+                                </label>
                             `).join('')}
                         </div>
                     </div>
@@ -1372,18 +1387,15 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         document.body.appendChild(modal);
 
         setupModalClose(modal, 'close-settings-modal', 'settings-overlay');
+        updateVideoInfo();
 
-        document.querySelectorAll('.format-item').forEach(item => {
-            item.addEventListener('click', (e) => {
-                if (e.target.classList.contains('remove-ext-btn')) return;
-                document.querySelectorAll('.format-item').forEach(i => i.classList.remove('selected'));
-                item.classList.add('selected');
-                settings.format = item.getAttribute('data-value');
-            });
+        modal.querySelector('#format-list').addEventListener('change', event => {
+            if (event.target.name === 'settings-format') settings.format = event.target.value;
         });
 
         document.querySelectorAll('.format-item .remove-ext-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
+                e.preventDefault();
                 e.stopPropagation();
                 const item = btn.closest('.format-item');
                 const index = parseInt(item.getAttribute('data-index'));
@@ -1398,7 +1410,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     StorageManager.saveDownloadSettings(settings);
                 }
 
-                modal.remove();
+                removeModal(modal.id);
                 showSettingsModal();
             });
         });
@@ -1427,27 +1439,29 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         document.getElementById('add-custom-ext-btn').addEventListener('click', () => {
             createCustomExtensionDialog(() => {
-                modal.remove();
+                removeModal(modal.id);
                 showSettingsModal();
             });
         });
 
         document.getElementById('reset-settings').addEventListener('click', () => {
             Object.assign(settings, CONFIG.DEFAULT_DOWNLOAD_SETTINGS);
+            StorageManager.saveDownloadSettings(settings);
             StorageManager.saveCustomExtensions([]);
-            modal.remove();
+            removeModal(modal.id);
             showSettingsModal();
             showToast('已恢复默认设置', 'success');
         });
 
         document.getElementById('save-settings').addEventListener('click', () => {
             StorageManager.saveDownloadSettings(settings);
-            modal.remove();
+            removeModal(modal.id);
             showToast('设置已保存', 'success');
         });
     }
 
     function showBatchDownloadModal() {
+        removeModal('batch-download-modal');
         disableScroll();
 
         let videoList = state.videoList;
@@ -1466,8 +1480,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             <div class="modal-overlay" id="batch-overlay"></div>
             <div class="modal-content batch-modal">
                 <div class="modal-header">
-                    <h2><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg> 批量下载字幕</h2>
-                    <button id="close-batch-modal" class="close-btn"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+                    <h2> 批量下载字幕</h2>
+                    <button id="close-batch-modal" class="close-btn">×</button>
                 </div>
                 <div class="modal-body">
                     <div class="batch-section">
@@ -1483,18 +1497,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     </div>
                     <div class="batch-section">
                         <h3>字幕语言</h3>
-                        <div class="custom-select" id="batch-language-container">
-                            <div class="custom-select-trigger" id="batch-language-trigger">
-                                <span class="custom-select-value">自动选择</span>
-                                <span class="custom-select-icon-wrapper">
-                                    <svg viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></svg>
-                                </span>
-                            </div>
-                            <div class="custom-select-dropdown" id="batch-language-dropdown">
-                                <div class="custom-select-option" data-value="auto">自动选择</div>
-                            </div>
-                        </div>
-                        <input type="hidden" id="batch-language" value="auto">
+                        <select id="batch-language" aria-label="字幕语言"><option value="auto">自动选择</option></select>
                     </div>
                     <div class="batch-section">
                         <h3>输出格式</h3>
@@ -1505,7 +1508,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     </div>
                 </div>
                 <div class="modal-footer">
-                    <button id="start-batch-download" class="btn-primary"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg> 开始下载</button>
+                    <button id="start-batch-download" class="btn-primary"> 开始下载</button>
                 </div>
             </div>
         `;
@@ -1513,29 +1516,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         setupModalClose(modal, 'close-batch-modal', 'batch-overlay');
 
-        const batchLanguageContainer = document.getElementById('batch-language-container');
-        const batchLanguageTrigger = document.getElementById('batch-language-trigger');
-        const batchLanguageDropdown = document.getElementById('batch-language-dropdown');
-        const batchLanguageValue = batchLanguageTrigger.querySelector('.custom-select-value');
-        const batchLanguageHidden = document.getElementById('batch-language');
 
-        const toggleBatchLanguageDropdown = () => {
-            batchLanguageDropdown.classList.toggle('active');
-            batchLanguageContainer.classList.toggle('active');
-        };
-
-        batchLanguageTrigger.addEventListener('click', toggleBatchLanguageDropdown);
-        document.addEventListener('click', (e) => !batchLanguageContainer.contains(e.target) && batchLanguageDropdown.classList.remove('active') && batchLanguageContainer.classList.remove('active'));
-
-        batchLanguageDropdown.querySelectorAll('.custom-select-option').forEach(option => {
-            option.addEventListener('click', () => {
-                const value = option.dataset.value;
-                batchLanguageValue.textContent = option.textContent;
-                batchLanguageHidden.value = value;
-                batchLanguageDropdown.classList.remove('active');
-                batchLanguageContainer.classList.remove('active');
-            });
-        });
 
         const videoCheckboxes = document.getElementById('video-checkboxes');
         if (videoList.length === 0) {
@@ -1598,18 +1579,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 return;
             }
 
+            const startButton = modal.querySelector('#start-batch-download');
+            if (startButton.disabled) return;
+            startButton.disabled = true;
+            let completed = 0;
             showToast(`开始下载 ${selectedVideos.length} 个视频的字幕...`, 'info');
 
             for (const video of selectedVideos) {
                 try {
-                    await downloadVideoSubtitle(video, format, settings);
+                    if (await downloadVideoSubtitle(video, format, settings)) completed++;
                     await new Promise(resolve => setTimeout(resolve, 500));
                 } catch (error) {
                     console.error(`下载 ${video.bvid} 字幕失败:`, error);
                 }
             }
 
-            showToast('批量下载完成', 'success');
+            showToast(`批量下载完成：${completed}/${selectedVideos.length}；未完成 ${selectedVideos.length - completed} 个`, completed === selectedVideos.length ? 'success' : 'warning');
             removeModal('batch-download-modal');
         }
     }
@@ -1650,6 +1635,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         let mimeType = 'text/plain';
 
         switch (format) {
+            case 'md': convertedContent = convertToMD(content, settings.includeSubtitleTime); mimeType = 'text/markdown'; break;
+            case 'html': convertedContent = convertToHTML(content, settings.includeSubtitleTime); mimeType = 'text/html'; break;
             case 'srt': convertedContent = convertToSRT(content); mimeType = 'text/x-subrip'; break;
             case 'vtt': convertedContent = convertToVTT(content); mimeType = 'text/vtt'; break;
             case 'json': convertedContent = convertToJSON(content); mimeType = 'application/json'; break;
@@ -1661,6 +1648,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
 
         downloadFile(convertedContent, `${filename}.${format}`, mimeType);
+        return true;
     }
 
     function createFloatButton() {
@@ -1669,7 +1657,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         const btn = document.createElement('button');
         btn.id = 'bili-transcript-btn';
         btn.className = 'bili-transcript-btn';
-        btn.innerHTML = '<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>';
+        btn.textContent = '字幕';
         btn.title = '提取字幕';
         btn.addEventListener('click', createModal);
         document.body.appendChild(btn);
@@ -1712,939 +1700,93 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }, 500);
     }
 
+    // Scoped Lite UI stylesheet.
     function injectStyles() {
+        if (document.getElementById('bili-transcript-lite-style')) return;
         const style = document.createElement('style');
+        style.id = 'bili-transcript-lite-style';
         style.textContent = `
-:root {
-    --primary: #a18276;
-    --primary-dark: #8a6f64;
-    --primary-light: #b89a8f;
-    --accent: #f4b886;
-    --bg-primary: #fefdfb;
-    --bg-secondary: #fcdfa6;
-    --bg-surface: #f4b886;
-    --bg-white: #ffffff;
-    --bg-transparent: rgba(255, 255, 255, 0.02);
-    --bg-hover: rgba(161, 130, 118, 0.1);
-    --bg-selected: rgba(161, 130, 118, 0.15);
-    --bg-selected-hover: rgba(161, 130, 118, 0.2);
-    --bg-highlight: rgba(244, 184, 134, 0.3);
-    --text-primary: #5c4a42;
-    --text-secondary: #8a7268;
-    --text-muted: #a89a90;
-    --text-white: #ffffff;
-    --border: rgba(92, 74, 66, 0.12);
-    --border-hover: rgba(92, 74, 66, 0.2);
-    --border-light: rgba(255, 255, 255, 0.15);
-    --success: #7a9e7e;
-    --error: #c97b7b;
-    --warning: #e6a75c;
-    --info: #a18276;
-    --scrollbar-track-surface: rgba(161, 130, 118, 0.08);
-    --scrollbar-thumb-surface: rgba(161, 130, 118, 0.4);
-    --scrollbar-thumb-surface-hover: rgba(161, 130, 118, 0.6);
-    --shadow-primary: rgba(161, 130, 118, 0.35);
-    --shadow-primary-hover: rgba(161, 130, 118, 0.45);
-    --shadow-primary-active: rgba(161, 130, 118, 0.3);
-    --shadow-modal: rgba(0, 0, 0, 0.15);
-    --shadow-toast: rgba(0, 0, 0, 0.3);
-    --shadow-dropdown: rgba(161, 130, 118, 0.15);
-    --icon-bg: rgba(59, 130, 246, 0.1);
-    --focus-ring: rgba(161, 130, 118, 0.2);
-    --btn-close-bg: rgba(255, 255, 255, 0.15);
-    --btn-close-hover: rgba(255, 255, 255, 0.25);
-    --btn-small-hover: rgba(255, 255, 255, 0.05);
-    --btn-small-active: rgba(255, 255, 255, 0.08);
-}
-
-/* 通用基础样式 */
-* { box-sizing: border-box; }
-.base-transition { transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
-.base-card { border: 1px solid var(--border); border-radius: 10px; background: var(--bg-surface); }
-.base-input {
-    width: 100%; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px;
-    font-size: 14px; background: var(--bg-surface); color: var(--text-primary);
-    font-family: inherit; outline: none;
-}
-.base-input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--focus-ring); background: var(--bg-white); }
-.base-btn {
-    padding: 14px 32px; border: none; border-radius: 16px; font-size: 15px; font-weight: 600;
-    cursor: pointer; font-family: inherit; display: inline-flex; align-items: center;
-    justify-content: center; gap: 10px; min-width: 120px;
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.base-btn:hover {
-    transform: translateY(-2px);
-}
-.base-btn:active {
-    transform: translateY(0);
-}
-.base-btn-small {
-    padding: 12px 20px; border: none; border-radius: 12px; font-size: 14px; font-weight: 600;
-    cursor: pointer; font-family: inherit; background: var(--bg-surface); color: var(--text-primary);
-    border: 1px solid var(--border);
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.base-btn-small:hover {
-    background: var(--btn-small-hover);
-    border-color: var(--border-hover);
-    transform: translateY(-2px);
-}
-.base-btn-small:active {
-    background: var(--btn-small-active);
-    transform: translateY(0);
-}
-
-/* 统一滚动条样式 */
-.subtitle-content, .checkbox-list, .format-list, .custom-select-dropdown, .settings-modal .modal-body {
-    scrollbar-width: thin;
-    scrollbar-color: var(--scrollbar-thumb-surface) var(--scrollbar-track-surface);
-}
-.subtitle-content::-webkit-scrollbar,
-.checkbox-list::-webkit-scrollbar,
-.format-list::-webkit-scrollbar,
-.custom-select-dropdown::-webkit-scrollbar,
-.settings-modal .modal-body::-webkit-scrollbar {
-    width: 6px;
-    display: block;
-}
-.subtitle-content::-webkit-scrollbar-track,
-.checkbox-list::-webkit-scrollbar-track,
-.format-list::-webkit-scrollbar-track,
-.custom-select-dropdown::-webkit-scrollbar-track,
-.settings-modal .modal-body::-webkit-scrollbar-track {
-    background: var(--scrollbar-track-surface);
-    border-radius: 3px;
-}
-.subtitle-content::-webkit-scrollbar-thumb,
-.checkbox-list::-webkit-scrollbar-thumb,
-.format-list::-webkit-scrollbar-thumb,
-.custom-select-dropdown::-webkit-scrollbar-thumb,
-.settings-modal .modal-body::-webkit-scrollbar-thumb {
-    background: var(--scrollbar-thumb-surface);
-    border-radius: 3px;
-}
-.subtitle-content::-webkit-scrollbar-thumb:hover,
-.checkbox-list::-webkit-scrollbar-thumb:hover,
-.format-list::-webkit-scrollbar-thumb:hover,
-.custom-select-dropdown::-webkit-scrollbar-thumb:hover,
-.settings-modal .modal-body::-webkit-scrollbar-thumb:hover {
-    background: var(--scrollbar-thumb-surface-hover);
-}
-
-/* 动画 */
-@keyframes slideDown { from { opacity: 0; transform: translateX(-50%) translateY(-20px); } to { opacity: 1; transform: translateX(-50%) translateY(0); } }
-@keyframes slideUp { from { opacity: 1; transform: translateX(-50%) translateY(0); } to { opacity: 0; transform: translateX(-50%) translateY(-20px); } }
-@keyframes spin { to { transform: rotate(360deg); } }
-@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-
-/* 全局字体 */
+/* All UI styles are scoped; never override Bilibili's :root or generic controls. */
 .bili-transcript-modal, .bili-transcript-toast, .bili-transcript-btn {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}
-
-/* 悬浮按钮 */
-.bili-transcript-btn {
-    position: fixed; right: 24px; bottom: 24px;
-    width: 52px; height: 52px; border-radius: 50%;
-    background: var(--primary);
-    color: var(--text-white); border: none;
-    box-shadow: 0 6px 20px var(--shadow-primary), 0 0 0 1px var(--border-light) inset;
-    font-size: 20px; cursor: pointer; z-index: 10000;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    display: flex; align-items: center; justify-content: center;
-}
-.bili-transcript-btn:hover {
-    transform: scale(1.1) translateY(-2px);
-    box-shadow: 0 10px 30px var(--shadow-primary-hover), 0 0 0 1px rgba(255,255,255,0.2) inset;
-}
-
-/* Toast提示 */
-.bili-transcript-toast {
-    position: fixed; top: 20px; left: 50%; transform: translateX(-50%);
-    padding: 12px 20px; border-radius: 8px; box-shadow: 0 8px 24px var(--shadow-toast);
-    z-index: 10006; display: flex; align-items: center; gap: 10px; font-size: 14px;
-    color: var(--text-white); animation: slideDown 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.bili-transcript-toast-success { background: var(--success); }
-.bili-transcript-toast-error { background: var(--error); }
-.bili-transcript-toast-warning { background: var(--warning); }
-.bili-transcript-toast-info { background: var(--info); }
-.toast-icon { flex-shrink: 0; }
-.toast-message { font-size: 14px; font-weight: 500; }
-
-/* 模态框通用 */
-.bili-transcript-modal {
-    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-    z-index: 10002; display: flex; align-items: center; justify-content: center;
-    opacity: 1; transition: opacity 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    backdrop-filter: blur(4px);
-}
-.modal-overlay {
-    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-    background: transparent;
-}
-.modal-content {
-    position: relative; width: 92%; max-width: 640px; max-height: 88vh;
-    background: var(--bg-primary);
-    border-radius: 14px; overflow: hidden;
-    box-shadow: 0 12px 40px var(--shadow-modal), 0 0 0 1px var(--border);
-    display: flex; flex-direction: column;
-}
-.modal-header {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 18px 22px;
-    background: var(--primary);
-    color: var(--text-white);
-    flex-shrink: 0;
-    border-bottom: 1px solid var(--border-light);
-}
-.modal-header h2 {
-    margin: 0; font-size: 16px; font-weight: 600; line-height: 1.3;
-    display: flex; align-items: center; gap: 10px;
-}
-.modal-icon { flex-shrink: 0; }
-.close-btn {
-    width: 34px; height: 34px; border: none;
-    background: var(--btn-close-bg);
-    color: var(--text-white);
-    border-radius: 12px;
-    cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    padding: 0;
-    font-size: 16px;
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.close-btn:hover {
-    background: var(--btn-close-hover);
-    transform: scale(1.15);
-}
-.modal-body {
-    padding: 24px;
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    overflow: hidden;
-}
-.modal-footer {
-    display: flex; gap: 10px; justify-content: flex-end;
-    padding: 16px 22px;
-    border-top: 1px solid var(--border);
-    background: var(--bg-transparent);
-    flex-shrink: 0;
-}
-.btn-primary {
-    padding: 10px 20px; border: none; border-radius: 12px; font-size: 14px; font-weight: 600;
-    cursor: pointer; font-family: inherit; display: inline-flex; align-items: center;
-    justify-content: center; gap: 8px; min-width: 80px;
-    background: var(--primary);
-    color: var(--text-white);
-    box-shadow: 0 4px 12px var(--shadow-primary);
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.btn-primary:hover {
-    transform: translateY(-2px);
-    box-shadow: 0 6px 20px var(--shadow-primary-hover);
-}
-.btn-primary:active {
-    transform: translateY(0);
-    box-shadow: 0 3px 10px var(--shadow-primary-active);
-}
-.btn-secondary {
-    padding: 10px 20px; border: 1px solid var(--border); border-radius: 12px; font-size: 14px; font-weight: 600;
-    cursor: pointer; font-family: inherit; display: inline-flex; align-items: center;
-    justify-content: center; gap: 8px; min-width: 80px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.btn-secondary:hover {
-    background: var(--bg-secondary);
-    border-color: var(--border-hover);
-    transform: translateY(-2px);
-}
-.btn-secondary:active {
-    transform: translateY(0);
-}
-.btn-small {
-    padding: 8px 16px; border: 1px solid var(--border); border-radius: 10px; font-size: 13px; font-weight: 600;
-    cursor: pointer; font-family: inherit; display: inline-flex; align-items: center;
-    justify-content: center; gap: 6px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.btn-small:hover {
-    background: var(--bg-secondary);
-    border-color: var(--border-hover);
-    transform: translateY(-1px);
-}
-.btn-small:active {
-    transform: translateY(0);
-}
-
-/* 视频信息 */
-.video-info {
-    padding: 18px 20px;
-    background: var(--bg-surface);
-    border-radius: 12px;
-    border: 1px solid var(--border);
-    flex-shrink: 0;
-}
-.info-row { display: flex; margin-bottom: 14px; align-items: flex-start; }
-.info-row:last-child { margin-bottom: 0; }
-.info-label {
-    font-weight: 600;
-    color: var(--text-secondary);
-    width: 60px;
-    flex-shrink: 0;
-    font-size: 13px;
-    letter-spacing: 0.5px;
-}
-.info-value {
-    color: var(--text-primary);
-    word-break: break-all;
-    font-size: 14px;
-    line-height: 1.65;
-    font-weight: 400;
-}
-
-/* 自定义下拉框 */
-.selector-container { flex-shrink: 0; }
-.custom-select {
-    position: relative;
-    width: 100%;
-    z-index: 10;
-}
-.custom-select-trigger {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    width: 100%;
-    padding: 13px 16px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 14px;
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.custom-select-trigger:hover {
-    border-color: var(--border-hover);
-    background: var(--bg-surface);
-}
-.custom-select-trigger:active { transform: scale(0.98); }
-.custom-select-value { flex: 1; text-align: left; margin: 0; }
-.custom-select-icon-wrapper {
-    flex-shrink: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 20px;
-    height: 20px;
-    margin-left: 12px;
-    color: var(--text-secondary);
-    transition: color 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.custom-select-trigger:hover .custom-select-icon-wrapper,
-.custom-select.active .custom-select-icon-wrapper {
-    color: var(--text-primary);
-}
-.custom-select-icon-wrapper svg {
-    width: 16px;
-    height: 16px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 2;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-}
-.custom-select-dropdown {
-    position: absolute;
-    top: calc(100% + 8px);
-    left: 0;
-    right: 0;
-    background: var(--bg-primary);
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    box-shadow: 0 8px 24px var(--shadow-dropdown);
-    opacity: 0;
-    visibility: hidden;
-    transform: translateY(-8px);
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    z-index: 100;
-    max-height: 200px;
-    overflow-y: auto;
-}
-.custom-select-dropdown.active {
-    opacity: 1;
-    visibility: visible;
-    transform: translateY(0);
-}
-.custom-select-option {
-    padding: 11px 16px;
-    font-size: 14px;
-    color: var(--text-primary);
-    cursor: pointer;
-    transition: background 0.15s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.custom-select-option:hover { background: var(--bg-hover); }
-.custom-select-option.disabled {
-    color: var(--text-muted);
-    cursor: not-allowed;
-    opacity: 0.6;
-}
-.custom-select-option.disabled:hover { background: none; }
-
-/* 原生下拉框 */
-.video-select {
-    width: 100%; padding: 13px 16px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 14px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-family: inherit;
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    appearance: none;
-    position: relative;
-}
-.video-select:focus {
-    outline: none;
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--focus-ring);
-    background: var(--bg-white);
-}
-.video-select:hover {
-    border-color: var(--border-hover);
-    background: var(--bg-white);
-}
-
-/* 搜索框 */
-.search-container { flex-shrink: 0; }
-.search-input-wrapper {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 8px 12px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    background: var(--bg-surface);
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.search-input-wrapper:focus-within {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--focus-ring);
-    background: var(--bg-white);
-}
-.search-icon { color: var(--text-secondary); flex-shrink: 0; }
-.search-input {
-    flex: 1;
-    border: none;
-    background: transparent;
-    font-size: 14px;
-    color: var(--text-primary);
-    font-family: inherit;
-    outline: none;
-}
-.search-input::placeholder { color: var(--text-muted); }
-.search-nav {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-}
-.search-nav-btn {
-    width: 32px;
-    height: 32px;
-    border: none;
-    border-radius: 10px;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 14px;
-    cursor: pointer;
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-}
-.search-nav-btn:hover {
-    background: var(--btn-small-hover);
-    color: var(--text-primary);
-    transform: scale(1.1);
-}
-.search-status {
-    font-size: 12px;
-    color: var(--text-muted);
-    min-width: 40px;
-    text-align: center;
-}
-.highlight {
-    background: var(--bg-highlight);
-    padding: 0 2px;
-    border-radius: 2px;
-    font-weight: 500;
-}
-.search-match { background: var(--bg-selected); }
-.subtitle-item.search-selected {
-    background: var(--bg-selected-hover);
-    border-left: 3px solid var(--primary);
-}
-
-/* 字幕内容 */
-.subtitle-content-wrapper {
-    flex: 0 1 420px;
-    min-height: 180px;
-    max-height: 420px;
-}
-.subtitle-content {
-    height: 100%;
-    overflow-y: auto;
-    overflow-x: hidden;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px;
-    background: var(--bg-primary);
-}
-.loading {
-    text-align: center;
-    padding: 40px;
-    color: var(--text-muted);
-    font-size: 14px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    gap: 10px;
-}
-.loading-spinner { animation: spin 1.5s linear infinite; }
-.loading-path { animation: pulse 1.5s ease-in-out infinite; }
-.no-subtitles {
-    text-align: center;
-    padding: 40px;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-}
-.no-subtitles-icon {
-    width: 64px;
-    height: 64px;
-    margin-bottom: 20px;
-    background: var(--icon-bg);
-    border-radius: 50%;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    font-size: 28px;
-}
-.no-subtitles h3 {
-    margin: 0 0 10px 0;
-    color: var(--text-primary);
-    font-size: 17px;
-    font-weight: 600;
-}
-.no-subtitles p {
-    margin: 0 0 20px 0;
-    color: var(--text-muted);
-    font-size: 14px;
-    line-height: 1.5;
-}
-.no-subtitles-tips {
-    list-style: none;
-    padding: 0;
-    margin: 0;
-    text-align: left;
-}
-.no-subtitles-tips li {
-    margin-bottom: 8px;
-    font-size: 13px;
-    color: var(--text-muted);
-    padding-left: 20px;
-    position: relative;
-}
-.no-subtitles-tips li::before {
-    content: '';
-    position: absolute;
-    left: 0;
-    top: 6px;
-    width: 4px;
-    height: 4px;
-    background: var(--primary);
-    border-radius: 50%;
-}
-.subtitle-item {
-    display: flex; gap: 20px; padding: 12px 14px;
-    border-bottom: 1px solid var(--border);
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    border-radius: 8px;
-    margin: 2px 0;
-}
-.subtitle-item:last-child { border-bottom: none; }
-.subtitle-item:hover {
-    background: var(--bg-hover);
-    transform: translateX(4px);
-}
-.subtitle-time {
-    color: var(--primary);
-    font-family: 'SF Mono', 'Monaco', 'Inconsolata', monospace;
-    font-size: 12px;
-    font-weight: 500;
-    flex-shrink: 0;
-    width: 90px;
-    text-align: right;
-    letter-spacing: 0.3px;
-}
-.subtitle-text {
-    color: var(--text-primary);
-    font-size: 14px;
-    line-height: 1.6;
-    flex: 1;
-    padding-left: 12px;
-    border-left: 1px solid var(--border);
-}
-
-/* 批量下载 */
-.batch-modal { max-width: 680px; }
-.batch-section { margin-bottom: 24px; }
-.batch-section:last-child { margin-bottom: 0; }
-.batch-section h3 {
-    margin: 0 0 14px 0;
-    font-size: 14px;
-    color: var(--text-primary);
-    font-weight: 600;
-}
-.batch-header {
-    display: flex; align-items: center; justify-content: space-between;
-    margin-bottom: 16px;
-}
-.batch-header h3 { margin: 0; font-size: 15px; }
-.batch-actions { display: flex; gap: 8px; }
-.checkbox-list {
-    max-height: 260px;
-    overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 4px;
-    background: var(--bg-secondary);
-}
-.checkbox-item {
-    display: flex;
-    align-items: center;
-    padding: 11px 14px;
-    cursor: pointer;
-    border-radius: 8px;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    gap: 11px;
-}
-.checkbox-item:hover { background: var(--bg-hover); }
-.checkbox-item:has(input:checked) { background: var(--bg-selected); }
-.checkbox-item:has(input:checked):hover { background: var(--bg-selected-hover); }
-.checkbox-item input {
-    width: 16px;
-    height: 16px;
-    accent-color: var(--primary);
-    cursor: pointer;
-    flex-shrink: 0;
-}
-.checkbox-item span {
-    color: var(--text-primary);
-    font-size: 14px;
-    line-height: 1.5;
-    font-weight: 400;
-}
-
-/* A版：批量下载暖色高对比度，仅作用于批量弹窗。 */
-#batch-download-modal {
-    --text-primary: #352a25;
-    --text-secondary: #65554b;
-    --text-muted: #65554b;
-    --bg-primary: #fffdfb;
-    --bg-white: #fffdfb;
-    --bg-secondary: #fff8ef;
-    --bg-surface: #fff0dc;
+    --primary: #79442b; --primary-dark: #60341f;
+    --bg-primary: #fffdfb; --bg-white: #fffdfb; --bg-secondary: #fff8ef;
+    --bg-surface: #fff0dc; --bg-hover: #f9e4c8; --bg-selected: #fff0dc;
+    --text-primary: #352a25; --text-secondary: #65554b; --text-muted: #65554b;
     --border: #d6c7bb;
-    --primary: #79442b;
-    --primary-dark: #60341f;
-    color: #352a25;
-    color-scheme: light;
+    font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif;
+    color: var(--text-primary); color-scheme: light;
 }
-#batch-download-modal .modal-content { background: #fffdfb; color: #352a25; }
-#batch-download-modal .modal-header { background: #ead9cc; color: #352a25; }
-#batch-download-modal .modal-header h2 { color: #352a25; }
-#batch-download-modal .close-btn { background: #fffdfb; color: #79442b; }
-#batch-download-modal .batch-header { gap: 12px; flex-wrap: wrap; }
-#batch-download-modal .btn-small { background: #fffdfb; color: #352a25; border: 1px solid #d6c7bb; }
-#batch-download-modal .btn-small:hover { background: #fff0dc; border-color: #79442b; }
-#batch-download-modal .checkbox-list {
-    background: #fff8ef;
-    border: 1px solid #d6c7bb;
-    padding: 8px;
-    display: grid;
-    gap: 8px;
-    scrollbar-color: #94735d #fff8ef;
-}
-#batch-download-modal .checkbox-item {
-    background: #fffdfb;
-    color: #352a25;
-    border: 1px solid #d6c7bb;
-    padding: 12px;
-    min-height: 52px;
-    box-sizing: border-box;
-    transition: background-color 0.15s, border-color 0.15s;
-}
-#batch-download-modal .checkbox-item:has(input:checked) {
-    background: #fff0dc;
-    border-color: #79442b;
-    box-shadow: inset 3px 0 #79442b;
-}
-#batch-download-modal .checkbox-item:hover { background: #f9e4c8; border-color: #79442b; }
-#batch-download-modal .checkbox-item:focus-within { outline: 2px solid #79442b; outline-offset: 1px; }
-#batch-download-modal .checkbox-item input { width: 19px; height: 19px; accent-color: #79442b; margin: 0; }
-#batch-download-modal .checkbox-item .batch-video-title {
-    color: #352a25;
-    flex: 1;
-    min-width: 0;
-    overflow-wrap: anywhere;
-    white-space: normal;
-    font-size: 14px;
-    line-height: 1.5;
-}
-#batch-download-modal .checkbox-item .batch-selection-state { color: #65554b; font-size: 12px; flex-shrink: 0; }
-#batch-download-modal .checkbox-item:has(input:checked) .batch-selection-state { color: #79442b; font-weight: 600; }
-#batch-selection-count { color: #65554b; margin-top: 10px; font-size: 13px; }
-#batch-download-modal .checkbox-list::-webkit-scrollbar-thumb { background: #94735d; }
-#batch-download-modal .checkbox-list::-webkit-scrollbar-track { background: #fff8ef; }
-@media (max-width: 480px) {
-    #batch-download-modal .checkbox-item { padding: 10px; gap: 8px; }
-    #batch-download-modal .batch-selection-state { display: none; }
-}
-
-/* 下载确认弹窗 */
-.download-modal { max-width: 500px; }
-.download-section {
-    margin-bottom: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-.download-label {
-    font-size: 13px;
-    color: var(--text-secondary);
-    font-weight: 500;
-}
-.download-input {
-    width: 100%;
-    padding: 12px 14px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 14px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-family: inherit;
-    outline: none;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.download-input:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--focus-ring);
-    background: var(--bg-white);
-}
-.download-format-display {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 12px 14px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 14px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-weight: 500;
-}
-.download-format-display .format-hint {
-    font-size: 12px;
-    color: var(--text-muted);
-    font-weight: normal;
-}
-.download-methods {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-.download-method-label {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    padding: 10px 14px;
-    border-radius: 8px;
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-    background: var(--bg-surface);
-    border: 1px solid var(--border);
-}
-.download-method-label:hover {
-    background: var(--btn-small-hover);
-    border-color: var(--border-hover);
-}
-.download-method-label input {
-    width: 16px;
-    height: 16px;
-    accent-color: var(--primary);
-    cursor: pointer;
-}
-.download-method-label span {
-    color: var(--text-primary);
-    font-size: 13px;
-}
-.download-method-label:has(input:checked) {
-    background: var(--primary);
-    border-color: var(--primary);
-}
-.download-method-label:has(input:checked) span {
-    color: var(--text-white);
-    font-weight: 600;
-}
-
-/* 设置弹窗 */
-.settings-modal {
-    max-width: 520px;
-    max-height: 80vh;
-    overflow-y: auto !important;
-    overflow-x: hidden;
-}
-.settings-modal .modal-body {
-    max-height: calc(80vh - 140px);
-    overflow-y: auto;
-}
-.settings-section { margin-bottom: 20px; }
-.settings-section:last-child { margin-bottom: 0; }
-.settings-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    margin-bottom: 12px;
-}
-.settings-section h3 {
-    margin: 0 0 12px 0;
-    font-size: 14px;
-    color: var(--text-primary);
-    font-weight: 600;
-}
-.settings-header h3 { margin: 0; }
-.settings-checkbox {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    cursor: pointer;
-    padding: 10px 12px;
-    border-radius: 8px;
-    transition: background 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.settings-checkbox:hover { background: var(--bg-hover); }
-.settings-checkbox input {
-    width: 17px;
-    height: 17px;
-    accent-color: var(--primary);
-    cursor: pointer;
-}
-.settings-checkbox span {
-    color: var(--text-primary);
-    font-size: 14px;
-}
-.format-list {
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    padding: 4px;
-    background: var(--bg-secondary);
-    max-height: 200px;
-    overflow-y: auto;
-}
-.format-item {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 10px 12px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.format-item:hover { background: var(--bg-hover); }
-.format-item.selected {
-    background: var(--bg-selected);
-    border: 1px solid var(--primary);
-    margin: -1px;
-}
-.format-name {
-    font-size: 14px;
-    color: var(--text-primary);
-}
-.remove-ext-btn {
-    padding: 8px 16px;
-    border: none;
-    border-radius: 10px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
-    background: var(--error);
-    color: white;
-    opacity: 0.9;
-}
-.remove-ext-btn:hover {
-    opacity: 1;
-    transform: scale(1.1);
-    box-shadow: 0 4px 12px rgba(201, 123, 123, 0.4);
-}
-
-/* 自定义扩展名弹窗 */
-.custom-ext-modal { max-width: 400px; }
-.custom-ext-section {
-    margin-bottom: 16px;
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-}
-.custom-ext-label {
-    font-size: 13px;
-    color: var(--text-secondary);
-    font-weight: 500;
-}
-.mime-hint {
-    font-size: 12px;
-    color: var(--text-muted);
-    margin-top: 4px;
-    padding: 8px 12px;
-    background: var(--bg-secondary);
-    border-radius: 6px;
-}
-.custom-ext-input {
-    width: 100%;
-    padding: 12px 14px;
-    border: 1px solid var(--border);
-    border-radius: 10px;
-    font-size: 14px;
-    background: var(--bg-surface);
-    color: var(--text-primary);
-    font-family: inherit;
-    outline: none;
-    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-}
-.custom-ext-input:focus {
-    border-color: var(--primary);
-    box-shadow: 0 0 0 3px var(--focus-ring);
-    background: var(--bg-white);
-}
-.custom-ext-input::placeholder { color: var(--text-muted); }
-
-/* 响应式 */
-@media (max-width: 480px) {
-    .modal-footer { flex-direction: column; }
-    .btn-primary, .btn-secondary { width: 100%; justify-content: center; }
-    .modal-body { padding: 16px; }
-    .modal-header { padding: 14px 16px; }
-    .search-nav { display: none; }
+.bili-transcript-modal { position: fixed; inset: 0; z-index: 10002; display: flex; align-items: center; justify-content: center; }
+.bili-transcript-modal *, .bili-transcript-modal *::before, .bili-transcript-modal *::after { box-sizing: border-box; }
+.bili-transcript-modal [hidden] { display: none !important; }
+.bili-transcript-modal .modal-overlay { position: absolute; inset: 0; background: rgba(0,0,0,.35); }
+.bili-transcript-modal .modal-content { position: relative; width: min(640px,92vw); max-height: 88vh; border: 1px solid var(--border); border-radius: 10px; background: var(--bg-primary); box-shadow: 0 8px 24px rgba(0,0,0,.16); display: flex; flex-direction: column; overflow: hidden; }
+.bili-transcript-modal .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 18px; background: #ead9cc; flex-shrink: 0; }
+.bili-transcript-modal h2 { font-size: 17px; margin: 0; color: var(--text-primary); }
+.bili-transcript-modal h3 { font-size: 14px; margin: 0 0 10px; color: var(--text-primary); }
+.bili-transcript-modal button { font: inherit; color: var(--text-primary); background: var(--bg-white); border: 1px solid var(--border); border-radius: 6px; padding: 7px 12px; cursor: pointer; }
+.bili-transcript-modal button:hover { background: var(--bg-hover); border-color: var(--primary); }
+.bili-transcript-modal button:disabled { opacity: .55; cursor: default; }
+.bili-transcript-modal :focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.bili-transcript-modal .btn-primary { background: var(--primary); color: #fff; border-color: var(--primary); }
+.bili-transcript-modal .btn-primary:hover { background: var(--primary-dark); }
+.bili-transcript-modal .close-btn { padding: 0; width: 34px; height: 34px; font-size: 22px; }
+.bili-transcript-modal .modal-body { padding: 18px; overflow-y: auto; min-height: 0; }
+.bili-transcript-modal .modal-footer { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 10px; padding: 12px 18px; border-top: 1px solid var(--border); flex-shrink: 0; }
+.bili-transcript-modal .footer-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.bili-transcript-modal input:not([type=checkbox]):not([type=radio]), .bili-transcript-modal select { font: inherit; color: var(--text-primary); background: var(--bg-white); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; width: 100%; min-width: 0; }
+.bili-transcript-modal input[type=checkbox], .bili-transcript-modal input[type=radio] { accent-color: var(--primary); width: 18px; height: 18px; flex-shrink: 0; }
+.bili-transcript-modal .lite-main { width: min(720px,92vw); height: min(760px,88vh); }
+.bili-transcript-modal .lite-main .modal-footer { justify-content: space-between; }
+.bili-transcript-modal .lite-controls { padding: 14px 18px 10px; flex-shrink: 0; }
+.bili-transcript-modal #video-title { font-weight: 600; margin-bottom: 10px; overflow-wrap: anywhere; max-height: 4.5em; overflow-y: auto; }
+.bili-transcript-modal .lite-selectors { display: flex; gap: 10px; margin-bottom: 10px; }
+.bili-transcript-modal .lite-selectors label { flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary); }
+.bili-transcript-modal .lite-selectors select { margin-top: 3px; font-size: 14px; }
+.bili-transcript-modal .search-container { display: flex; align-items: center; gap: 6px; }
+.bili-transcript-modal #subtitle-search { flex: 1; }
+.bili-transcript-modal #search-status { font-size: 12px; min-width: 42px; text-align: center; white-space: nowrap; }
+.bili-transcript-modal .subtitle-content { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 8px 18px; border-top: 1px solid var(--border); }
+.bili-transcript-modal .subtitle-item { display: flex; align-items: baseline; gap: 14px; width: 100%; text-align: left; border: 0; border-bottom: 1px solid #eee3d8; border-radius: 0; padding: 9px 8px; background: transparent; }
+.bili-transcript-modal .subtitle-time { color: var(--text-secondary); font-size: 12px; min-width: 48px; font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.bili-transcript-modal .subtitle-text { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.bili-transcript-modal .subtitle-item.search-match { background: #fff0dc; }
+.bili-transcript-modal .subtitle-item.search-selected { background: #f9e4c8; box-shadow: inset 3px 0 var(--primary); }
+.bili-transcript-modal mark { color: #352a25; background: #f6cf8a; }
+.bili-transcript-modal .no-subtitles { padding: 24px 8px; text-align: center; }
+.bili-transcript-modal .no-subtitles ul { text-align: left; display: inline-block; }
+.bili-transcript-modal .settings-section, .bili-transcript-modal .download-section, .bili-transcript-modal .batch-section { margin-bottom: 20px; }
+.bili-transcript-modal .settings-header, .bili-transcript-modal .batch-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.bili-transcript-modal .settings-header h3, .bili-transcript-modal .batch-header h3 { margin: 0; }
+.bili-transcript-modal .batch-actions { display: flex; gap: 8px; }
+.bili-transcript-modal .format-list { display: flex; flex-wrap: wrap; gap: 8px; }
+.bili-transcript-modal .format-item { display: flex; align-items: center; gap: 6px; padding: 8px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+.bili-transcript-modal .format-item:has(input:checked) { background: var(--bg-selected); border-color: var(--primary); }
+.bili-transcript-modal .remove-ext-btn { padding: 2px 6px; font-size: 12px; }
+.bili-transcript-modal .download-methods { display: flex; flex-wrap: wrap; gap: 12px; }
+.bili-transcript-modal .download-method-label, .bili-transcript-modal .settings-checkbox { display: flex; align-items: center; gap: 8px; padding: 8px 0; cursor: pointer; }
+.bili-transcript-modal .download-label, .bili-transcript-modal .custom-ext-label { display: block; margin-bottom: 6px; }
+.bili-transcript-modal .custom-ext-section { margin-bottom: 12px; }
+.bili-transcript-modal #video-details { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 8px; }
+.bili-transcript-modal summary { cursor: pointer; }
+.bili-transcript-modal .checkbox-list { max-height: 290px; overflow-y: auto; background: #fff8ef; border: 1px solid var(--border); border-radius: 8px; padding: 8px; display: grid; gap: 8px; scrollbar-color: #94735d #fff8ef; }
+.bili-transcript-modal .checkbox-item { display: flex; align-items: center; gap: 11px; color: var(--text-primary); background: #fffdfb; border: 1px solid var(--border); border-radius: 8px; padding: 12px; min-height: 52px; cursor: pointer; }
+.bili-transcript-modal .checkbox-item:has(input:checked) { background: #fff0dc; border-color: var(--primary); box-shadow: inset 3px 0 var(--primary); }
+.bili-transcript-modal .checkbox-item:hover { background: #f9e4c8; border-color: var(--primary); }
+.bili-transcript-modal .batch-video-title { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.bili-transcript-modal .batch-selection-state { color: var(--text-secondary); font-size: 12px; flex-shrink: 0; }
+.bili-transcript-modal #batch-selection-count { margin-top: 8px; color: var(--text-secondary); font-size: 13px; }
+.bili-transcript-btn { position: fixed; right: 24px; bottom: 80px; z-index: 10001; border: 1px solid #79442b; background: #fff0dc; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+.bili-transcript-toast { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 10006; max-width: 90vw; padding: 10px 16px; border: 1px solid #94735d; border-radius: 6px; background: #fff0dc; animation: lite-fade .12s; }
+@keyframes lite-fade { from { opacity: 0; } to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .bili-transcript-toast { animation: none; } }
+@media (max-width:480px) {
+    .bili-transcript-modal .lite-selectors { flex-direction: column; gap: 6px; }
+    .bili-transcript-modal .modal-header, .bili-transcript-modal .modal-footer { padding: 10px 12px; }
+    .bili-transcript-modal .lite-controls { padding: 10px 12px; }
+    .bili-transcript-modal .subtitle-content { padding: 6px; }
+    .bili-transcript-modal .batch-selection-state { display: none; }
+    .bili-transcript-modal button { padding: 7px 9px; }
 }
         `;
         document.head.appendChild(style);
