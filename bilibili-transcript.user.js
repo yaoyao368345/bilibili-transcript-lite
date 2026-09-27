@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         B站字幕提取器
 // @namespace    https://blog.qitongtingyu.online/
-// @version      1.0.0
+// @version      1.0.1
 // @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
 // @author       栖桐听雨
 // @match        https://www.bilibili.com/video/*
 // @icon         https://www.bilibili.com/favicon.ico
+// @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setClipboard
 // @grant        GM_setValue
@@ -18,6 +19,10 @@
 
 (function () {
     'use strict';
+
+    const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
+    let loadGeneration = 0;
+    const pagesByBvid = new Map();
 
     const CONFIG = {
         CACHE_MAX_SIZE: 50,
@@ -304,9 +309,8 @@
         try {
             return await request(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`);
         } catch (error) {
-            const title = document.querySelector('.video-title')?.textContent;
-            const cid = window.__INITIAL_STATE__?.videoData?.cid;
-            if (title && cid) return { data: { title, cid } };
+            const data = pageWindow.__INITIAL_STATE__?.videoData;
+            if (data?.bvid === bvid && data?.pages?.length) return { data };
             throw error;
         }
     }
@@ -341,8 +345,8 @@
 
     async function fetchSubtitlesFromWebInterface(bvid, cid) {
         try {
-            const response = await request(`https://api.bilibili.com/x/web-interface/view?bvid=${bvid}`);
-            return response.data?.subtitle?.list?.map(s => parseSubtitleItem(s)) || [];
+            const response = await request(`https://api.bilibili.com/x/player/v2?bvid=${bvid}&cid=${cid}`);
+            return response.data?.subtitle?.subtitles?.map(s => parseSubtitleItem(s)) || [];
         } catch (error) {
             console.error('备用接口获取字幕失败:', error);
             return [];
@@ -501,21 +505,33 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     function getCurrentVideoInfo() {
-        const url = window.location.href;
-        const bvidMatch = url.match(/\/video\/(BV[a-zA-Z0-9]+)/);
-        const bvid = bvidMatch ? bvidMatch[1] : '';
-
-        let cid = window.player?.getCurrentVideo?.().cid?.toString() || '';
-        if (!cid) cid = new URLSearchParams(window.location.search).get('cid') || '';
-
+        const url = new URL(window.location.href);
+        const bvid = url.pathname.match(/\/video\/(BV[a-zA-Z0-9]+)/)?.[1] || '';
+        const value = Number(url.searchParams.get('p') || 1);
+        const page = Number.isSafeInteger(value) && value > 0 ? value : 1;
         const titleEl = document.querySelector('.video-title') || document.querySelector('h1');
-        const title = titleEl ? titleEl.textContent.trim() : '';
-        const duration = document.querySelector('video')?.duration ? Math.floor(document.querySelector('video').duration) : 0;
+        // Resolve CID from the requested page, never from a potentially stale player.
+        return { bvid, page, cid: '', title: titleEl?.textContent.trim() || '', duration: 0 };
+    }
 
-        return { bvid, cid, title, duration };
+    async function resolveVideo(video) {
+        const info = await getVideoInfo(video.bvid);
+        const pages = info.data?.pages?.length ? info.data.pages : await getVideoPages(video.bvid);
+        pagesByBvid.set(video.bvid, pages);
+        const part = video.cid
+            ? pages.find(p => String(p.cid) === String(video.cid))
+            : pages.find(p => Number(p.page) === (video.page || 1));
+        if (!part?.cid) throw new Error('无法确定所选分P的CID，请刷新后重试');
+        return { ...video, cid: String(part.cid), page: Number(part.page),
+            title: pages.length > 1 ? `${info.data?.title || video.title} - P${part.page} ${part.part || ''}` : info.data?.title || video.title,
+            duration: Number(part.duration) || 0 };
     }
 
     function getVideoList() {
+        const bvid = state.currentVideo.bvid;
+        const pages = pagesByBvid.get(bvid);
+        if (pages?.length > 1) return pages.map(p => ({ bvid, cid: String(p.cid),
+            page: Number(p.page), title: `P${p.page} ${p.part || ''}`, duration: Number(p.duration) || 0 }));
         const result = [];
         const videoPodBody = document.querySelector('.video-pod__body');
 
@@ -541,7 +557,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         }
 
         if (result.length === 0) {
-            const playerPages = window.__INITIAL_STATE__?.videoData?.pages;
+            const playerPages = pageWindow.__INITIAL_STATE__?.videoData?.bvid === state.currentVideo.bvid ? pageWindow.__INITIAL_STATE__.videoData.pages : [];
             if (Array.isArray(playerPages) && playerPages.length > 0) {
                 playerPages.forEach((page, index) => {
                     result.push({
@@ -556,10 +572,11 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         return result;
     }
 
-    async function getVideoCID(bvid) {
+    async function getVideoCID(bvid, page = 1) {
         try {
             const videoInfo = await getVideoInfo(bvid);
-            return videoInfo.data?.cid || '';
+            const pages = videoInfo.data?.pages || await getVideoPages(bvid);
+            return String(pages.find(p => Number(p.page) === page)?.cid || '');
         } catch (error) {
             console.error('获取CID失败:', error);
             return '';
@@ -686,6 +703,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     async function loadSubtitles(retryCount = 0) {
+        const generation = ++loadGeneration;
+        const isStale = () => generation !== loadGeneration;
+        try {
+            const resolved = await resolveVideo({ ...state.currentVideo });
+            if (isStale()) return;
+            state.currentVideo = resolved;
+            initVideoList();
+            showVideoListSelector();
+            updateVideoInfo();
+        } catch (error) {
+            if (!isStale()) showToast(error.message || '读取分P信息失败', 'error');
+            return;
+        }
         state.subtitleDetails = [];
         state.subtitleList = [];
         state.searchResults = [];
@@ -711,12 +741,14 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         try {
             if (retryCount > 0) subtitleCache.clear(bvid, cid);
 
-            let subtitles = await fetchSubtitles(bvid, cid, retryCount > 0);
+            let subtitles;
+            try { subtitles = await fetchSubtitles(bvid, cid, retryCount > 0); }
+            catch { subtitles = await fetchSubtitlesFromWebInterface(bvid, cid); }
+            if (isStale()) return;
             if (subtitles.length === 0) subtitles = await fetchSubtitlesFromWebInterface(bvid, cid);
 
-            const video = document.querySelector('video');
-            const videoDuration = video?.duration ? Math.floor(video.duration) : state.currentVideo.duration;
-            if (video?.duration) state.currentVideo.duration = videoDuration;
+            if (isStale()) return;
+            const videoDuration = state.currentVideo.duration;
 
             updateVideoInfo();
 
@@ -735,6 +767,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
             for (const subtitle of sortedSubtitles) {
                 const subtitleContent = await getSubtitleContent(subtitle.url, bvid, cid, subtitle.id);
+                if (isStale()) return;
                 if (subtitleContent.length === 0) continue;
 
                 const lastSubtitle = subtitleContent[subtitleContent.length - 1];
@@ -759,6 +792,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 content = await getSubtitleContent(selectedSubtitle.url, bvid, cid, selectedSubtitle.id);
             }
 
+            if (isStale()) return;
             if (!selectedSubtitle) {
                 showToast('无法获取字幕内容', 'error');
                 return;
@@ -767,6 +801,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             if (isSubtitleMismatch(content, videoDuration) && retryCount < 3) {
                 showToast(`字幕不匹配，正在重试 (${retryCount + 1}/3)...`, 'warning');
                 await new Promise(resolve => setTimeout(resolve, 1000));
+                if (isStale()) return;
                 return loadSubtitles(retryCount + 1);
             }
 
@@ -780,6 +815,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             showToast('字幕加载完成', 'success');
 
         } catch (error) {
+            if (isStale()) return;
             console.error('加载字幕失败:', error);
             showToast('加载字幕失败', 'error');
         }
@@ -815,27 +851,16 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
         const currentBvid = state.currentVideo.bvid;
         const options = videoList.map((video, index) => {
-            const isSelected = video.bvid === currentBvid;
-            return `<option value="${video.bvid}" data-cid="${video.cid}" ${isSelected ? 'selected' : ''}>${index + 1}. ${sanitizeInput(video.title).substring(0, 30)}${video.title.length > 30 ? '...' : ''}</option>`;
+            const isSelected = video.bvid === currentBvid && String(video.cid) === String(state.currentVideo.cid);
+            return `<option value="${index}" data-cid="${video.cid}" ${isSelected ? 'selected' : ''}>${index + 1}. ${sanitizeInput(video.title).substring(0, 30)}${video.title.length > 30 ? '...' : ''}</option>`;
         }).join('');
 
         container.innerHTML = `<select id="video-select" class="video-select">${options}</select>`;
 
         document.getElementById('video-select')?.addEventListener('change', async (e) => {
-            const selectedBvid = e.target.value;
-            const selectedCid = e.target.options[e.target.selectedIndex].getAttribute('data-cid');
-            const video = videoList.find(v => v.bvid === selectedBvid);
-
+            const video = videoList[Number(e.target.value)];
             if (video) {
-                state.currentVideo.bvid = selectedBvid;
-                state.currentVideo.cid = selectedCid || '';
-                state.currentVideo.title = video.title;
-                state.currentVideo.duration = 0;
-
-                if (!state.currentVideo.cid) {
-                    const cid = await getVideoCID(selectedBvid);
-                    if (cid) state.currentVideo.cid = cid;
-                }
+                state.currentVideo = { ...video, page: video.page || 1 };
 
                 await loadSubtitles();
             }
@@ -947,6 +972,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     }
 
     function createModal() {
+        state.currentVideo = getCurrentVideoInfo();
         removeModal('bili-transcript-modal');
         disableScroll();
 
@@ -1579,8 +1605,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         if (content.length === 0) return;
 
         const videoInfo = await getVideoInfo(video.bvid);
-        const title = videoInfo.data?.title || video.bvid;
-        const duration = videoInfo.data?.duration || 0;
+        const part = videoInfo.data?.pages?.find(p => String(p.cid) === String(cid));
+        const title = part && videoInfo.data.pages.length > 1
+            ? `${videoInfo.data.title} - P${part.page} ${part.part || ''}` : videoInfo.data?.title || video.bvid;
+        const duration = part?.duration || videoInfo.data?.duration || 0;
 
         let filename = title.replace(/[\\/:*?"<>|]/g, '_');
         if (settings.includeBV && video.bvid) filename = `${filename}_${video.bvid}`;
@@ -1642,6 +1670,22 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         initVideoList();
         injectStyles();
         createFloatButton();
+        let lastRoute = `${location.pathname}${location.search}`;
+        setInterval(() => {
+            const route = `${location.pathname}${location.search}`;
+            if (route === lastRoute) return;
+            lastRoute = route;
+            ++loadGeneration;
+            state.currentVideo = getCurrentVideoInfo();
+            state.subtitleDetails = [];
+            state.subtitleList = [];
+            initVideoList();
+            if (document.getElementById('bili-transcript-modal')) {
+                const content = document.getElementById('subtitle-content');
+                if (content) content.textContent = '正在加载当前分P字幕…';
+                loadSubtitles();
+            }
+        }, 500);
     }
 
     function injectStyles() {
