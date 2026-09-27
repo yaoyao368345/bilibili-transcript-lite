@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站字幕提取器
 // @namespace    https://blog.qitongtingyu.online/
-// @version      1.1.0
+// @version      1.2.0
 // @description  从B站视频页面提取字幕文本，支持单个视频/分P视频下载，多种字幕导出格式，提供字幕搜索快速定位功能
 // @author       栖桐听雨
 // @match        https://www.bilibili.com/video/*
@@ -1074,6 +1074,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     function removeModal(modalId) {
         const modal = document.getElementById(modalId);
         if (!modal) return;
+        modal.onLiteClose?.();
         if (modalId === 'bili-transcript-modal') {
             ++loadGeneration;
             ui.controller?.abort();
@@ -1460,6 +1461,105 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
         });
     }
 
+    // Ask for a name only after video selection; the directory picker runs in the
+    // confirm button's user activation, before any network awaits.
+    function chooseBatchDirectory() {
+        return new Promise(resolve => {
+            removeModal('batch-name-modal');
+            disableScroll();
+            const modal = document.createElement('div');
+            modal.id = 'batch-name-modal';
+            modal.className = 'bili-transcript-modal';
+            modal.innerHTML = `
+                <div class="modal-overlay" id="batch-name-overlay"></div>
+                <section class="modal-content">
+                    <header class="modal-header"><h2>命名下载文件夹</h2><button id="close-batch-name" class="close-btn">×</button></header>
+                    <form id="batch-name-form">
+                        <div class="modal-body">
+                            <label class="download-label" for="batch-folder-name">文件夹名称</label>
+                            <input id="batch-folder-name" type="text" required maxlength="100" autocomplete="off" placeholder="例如：Linux 驱动学习字幕">
+                            <p>点击确定后选择保存位置，字幕将保存到其中的新文件夹。</p>
+                            <p id="batch-name-error" role="alert"></p>
+                        </div>
+                        <footer class="modal-footer"><button type="button" id="cancel-batch-name">取消</button><button type="submit" id="confirm-batch-name" class="btn-primary">确定</button></footer>
+                    </form>
+                </section>`;
+            document.body.append(modal);
+            let settled = false;
+            modal.onLiteClose = () => { if (!settled) { settled = true; resolve(null); } };
+            setupModalClose(modal, 'close-batch-name', 'batch-name-overlay');
+            modal.querySelector('#cancel-batch-name').onclick = () => removeModal(modal.id);
+            const input = modal.querySelector('#batch-folder-name');
+            const error = modal.querySelector('#batch-name-error');
+            const button = modal.querySelector('#confirm-batch-name');
+            input.focus();
+            modal.querySelector('form').addEventListener('submit', async event => {
+                event.preventDefault();
+                if (button.disabled || settled) return;
+                const name = input.value.trim();
+                if (!name || /[\\/:*?"<>|\u0000-\u001f]/.test(name) || /[. ]$/.test(name)
+                    || /^(?:\.{1,2}|con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\..*)?$/i.test(name)) {
+                    error.textContent = '请输入有效名称，不含路径符号、保留名称或末尾句点。';
+                    input.focus();
+                    return;
+                }
+                const owner = typeof window.showDirectoryPicker === 'function' ? window : pageWindow;
+                if (typeof owner.showDirectoryPicker !== 'function') {
+                    error.textContent = '当前浏览器不支持直接保存文件夹，请使用支持此功能的 Chrome 或 Edge。';
+                    return;
+                }
+                button.disabled = true;
+                error.textContent = '';
+                try {
+                    const parent = await owner.showDirectoryPicker({ mode: 'readwrite', startIn: 'downloads', id: 'bili-transcript-batch' });
+                    if (settled || !modal.isConnected) return;
+                    try {
+                        await parent.getDirectoryHandle(name);
+                        throw new Error('同名文件夹已存在，请换一个名称，避免覆盖原有文件。');
+                    } catch (existing) {
+                        if (existing.name !== 'NotFoundError') throw existing;
+                    }
+                    if (settled || !modal.isConnected) return;
+                    const directory = await parent.getDirectoryHandle(name, { create: true });
+                    if (settled || !modal.isConnected) return;
+                    settled = true;
+                    removeModal(modal.id);
+                    resolve({ directory, name });
+                } catch (failure) {
+                    if (settled) return;
+                    error.textContent = failure.name === 'AbortError' ? '已取消选择保存位置，可以重试或取消。'
+                        : failure.name === 'NotAllowedError' || failure.name === 'SecurityError'
+                            ? '未获得目录写入权限，请重新选择并允许写入。' : failure.message || '无法创建文件夹，请重试。';
+                } finally { button.disabled = false; }
+            });
+        });
+    }
+
+    async function saveSubtitleToDirectory(directory, content, filename, mimeType) {
+        // One filename component only, including for custom extensions. Never overwrite.
+        const safe = filename.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_').replace(/[. ]+$/, '');
+        const dot = safe.lastIndexOf('.');
+        const stem = (dot > 0 ? safe.slice(0, dot) : safe).slice(0, 160) || 'subtitle';
+        const extension = dot > 0 ? safe.slice(dot, dot + 30) : '';
+        const base = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(stem) ? '_' + stem : stem;
+        for (let index = 0; index < 10000; index++) {
+            const name = `${base}${index ? ` (${index + 1})` : ''}${extension}`;
+            try { await directory.getFileHandle(name); continue; }
+            catch (error) { if (error.name !== 'NotFoundError') throw error; }
+            const file = await directory.getFileHandle(name, { create: true });
+            const stream = await file.createWritable();
+            try {
+                await stream.write(new Blob([content], { type: mimeType }));
+                await stream.close();
+                return;
+            } catch (error) {
+                await stream.abort().catch(() => {});
+                throw error;
+            }
+        }
+        throw new Error('同名文件过多，无法保存。');
+    }
+
     function showBatchDownloadModal() {
         removeModal('batch-download-modal');
         disableScroll();
@@ -1582,24 +1682,31 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             const startButton = modal.querySelector('#start-batch-download');
             if (startButton.disabled) return;
             startButton.disabled = true;
+            const destination = await chooseBatchDirectory();
+            if (!destination || !modal.isConnected) {
+                startButton.disabled = false;
+                return;
+            }
             let completed = 0;
             showToast(`开始下载 ${selectedVideos.length} 个视频的字幕...`, 'info');
 
             for (const video of selectedVideos) {
                 try {
-                    if (await downloadVideoSubtitle(video, format, settings)) completed++;
+                    if (await downloadVideoSubtitle(video, format, settings, (content, filename, mimeType) =>
+                        saveSubtitleToDirectory(destination.directory, content, filename, mimeType))) completed++;
                     await new Promise(resolve => setTimeout(resolve, 500));
                 } catch (error) {
                     console.error(`下载 ${video.bvid} 字幕失败:`, error);
                 }
             }
 
-            showToast(`批量下载完成：${completed}/${selectedVideos.length}；未完成 ${selectedVideos.length - completed} 个`, completed === selectedVideos.length ? 'success' : 'warning');
-            removeModal('batch-download-modal');
+            showToast(`已保存到「${destination.name}」：${completed}/${selectedVideos.length}；未完成 ${selectedVideos.length - completed} 个`, completed === selectedVideos.length ? 'success' : 'warning', 6000);
+            // A closed old batch must never close a newly opened selection dialog.
+            if (document.getElementById(modal.id) === modal) removeModal(modal.id);
         }
     }
 
-    async function downloadVideoSubtitle(video, format, settings) {
+    async function downloadVideoSubtitle(video, format, settings, saveFile = downloadFile) {
         let cid = video.cid;
         if (!cid) cid = await getVideoCID(video.bvid);
         if (!cid) return;
@@ -1647,7 +1754,7 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             default: convertedContent = convertToTXT(content, settings.includeSubtitleTime);
         }
 
-        downloadFile(convertedContent, `${filename}.${format}`, mimeType);
+        await saveFile(convertedContent, `${filename}.${format}`, mimeType);
         return true;
     }
 

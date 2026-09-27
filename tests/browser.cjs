@@ -7,7 +7,7 @@ const source = fs.readFileSync(path.join(__dirname, '../bilibili-transcript.user
 const exposed = source.replace(/\}\)\(\);\s*$/, `window.testAPI = { state, ui, createModal, renderSubtitles, searchSubtitles, loadSubtitles,
   showSettingsModal, showDownloadConfirm, showBatchDownloadModal, removeModal, resolveVideo, getCurrentVideoInfo,
   convertToTXT, convertToSRT, convertToVTT, convertToCSV, convertToXML, convertToJSON, convertToASS, convertToLRC,
-  convertToMD, convertToHTML, StorageManager, subtitleCache, CONFIG, downloadVideoSubtitle };
+  convertToMD, convertToHTML, StorageManager, subtitleCache, CONFIG, downloadVideoSubtitle, saveSubtitleToDirectory };
 })();`);
 
 (async () => {
@@ -135,9 +135,66 @@ const exposed = source.replace(/\}\)\(\);\s*$/, `window.testAPI = { state, ui, c
  await page.locator('#video-checkboxes input').nth(8).check();
  await page.locator('#video-checkboxes input').nth(9).check();
  assert.equal(await page.locator('#batch-selection-count').textContent(),'已选择 2 / 10 个视频');
+ await page.evaluate(()=>{
+   window.savedFolders = new Map(); window.pickerCalls=0;
+   window.showDirectoryPicker = async () => {
+     window.pickerCalls++;
+     if(window.pickerFailure)throw new DOMException('Denied',window.pickerFailure);
+     return { getDirectoryHandle: async (name,options={}) => {
+       if(!window.savedFolders.has(name)) {
+         if(!options.create)throw new DOMException('Missing','NotFoundError');
+         const files=new Map();
+         window.savedFolders.set(name,{files,getFileHandle:async(filename,opts={})=>{
+           if(!files.has(filename)&&!opts.create)throw new DOMException('Missing','NotFoundError');
+           return {createWritable:async()=>({write:async blob=>files.set(filename,await blob.text()),close:async()=>{},abort:async()=>{}})};
+         }});
+       }
+       return window.savedFolders.get(name);
+     }};
+   };
+ });
+ const countBefore=await page.evaluate(()=>window.exports.length);
  await page.click('#start-batch-download');
+ await page.waitForSelector('#batch-name-modal');
+ assert.equal(await page.locator('#batch-folder-name').inputValue(),'');
+ assert.equal(await page.evaluate(()=>window.pickerCalls),0);
+ await page.click('#confirm-batch-name');
+ assert.equal(await page.evaluate(()=>window.pickerCalls),0);
+ await page.fill('#batch-folder-name','../错误');
+ await page.click('#confirm-batch-name');
+ assert.equal(await page.evaluate(()=>window.pickerCalls),0);
+ await page.click('#cancel-batch-name');
+ await page.waitForSelector('#batch-name-modal',{state:'detached'});
+ assert.equal(await page.locator('#start-batch-download').isEnabled(),true);
+ await page.click('#start-batch-download');
+ await page.fill('#batch-folder-name','Linux 学习字幕');
+ await page.evaluate(()=>window.pickerFailure='AbortError');
+ await page.click('#confirm-batch-name');
+ await page.waitForFunction(()=>document.querySelector('#batch-name-error').textContent.includes('已取消'));
+ assert.equal(await page.evaluate(()=>window.savedFolders.size),0);
+ await page.evaluate(()=>window.pickerFailure='NotAllowedError');
+ await page.click('#confirm-batch-name');
+ await page.waitForFunction(()=>document.querySelector('#batch-name-error').textContent.includes('权限'));
+ await page.evaluate(()=>window.pickerFailure=null);
+ await page.click('#confirm-batch-name');
  await page.waitForSelector('#batch-download-modal',{state:'detached'});
- assert((await page.evaluate(()=>window.lastFilename)).includes('P10'));
+ const folder=await page.evaluate(()=>Array.from(window.savedFolders.get('Linux 学习字幕').files));
+ assert.equal(folder.length,2);assert(folder.some(([name])=>name.includes('P9')));assert(folder.some(([name])=>name.includes('P10')));
+ assert(folder.every(([,content])=>content.includes('python')));
+ assert.equal(await page.evaluate(()=>window.exports.length),countBefore);
+ await page.click('[data-action="batch"]');await page.click('#start-batch-download');
+ await page.fill('#batch-folder-name','Linux 学习字幕');await page.click('#confirm-batch-name');
+ await page.waitForFunction(()=>document.querySelector('#batch-name-error').textContent.includes('已存在'));
+ await page.click('#cancel-batch-name');await page.click('#close-batch-modal');
+ // Duplicate names receive a suffix, so previously saved content is preserved.
+ await page.evaluate(async()=>{
+   const folder=window.savedFolders.get('Linux 学习字幕');
+   await testAPI.saveSubtitleToDirectory(folder,'first','同名.txt','text/plain');
+   await testAPI.saveSubtitleToDirectory(folder,'second','同名.txt','text/plain');
+ });
+ assert.deepEqual(await page.evaluate(()=>{
+   const files=window.savedFolders.get('Linux 学习字幕').files;return [files.get('同名.txt'),files.get('同名 (2).txt')];
+ }),['first','second']);
  for(const format of ['txt','md','csv','xml','html','srt','vtt','ass','lrc','json']) {
    const output=await page.evaluate(async format=>{
      await testAPI.downloadVideoSubtitle({bvid:'BV1owrpYKEtP',cid:'27694665372'},format,testAPI.StorageManager.getDownloadSettings());
